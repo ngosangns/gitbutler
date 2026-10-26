@@ -3,6 +3,11 @@
 [env]
 CHANNEL = "release"
 
+# The fork root .cargo/config.toml sets target-dir = "target" relative to the root.
+# Keep this app's build output (and package-app.sh) under apps/gb-gpui/target.
+[build]
+target-dir = "target"
+
 [net]
 git-fetch-with-cli = true
 
