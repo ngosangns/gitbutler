@@ -1,0 +1,21 @@
+# but-path reads CHANNEL at compile time. "release" selects the identifier
+# com.gitbutler.app, which is the data directory of the installed GitButler.app.
+[env]
+CHANNEL = "release"
+
+[net]
+git-fetch-with-cli = true
+
+# Local override against a SEPARATE checkout of tag release/0.22.3.
+# Never point this at the master clone in ~/Github/gitbutlerapp/gitbutler.
+# See UPSTREAM.md.
+# [patch."https://github.com/gitbutlerapp/gitbutler"]
+# but-api = { path = "/absolute/path/to/gitbutler-0.22.3/crates/but-api" }
+# but-core = { path = "/absolute/path/to/gitbutler-0.22.3/crates/but-core" }
+# but-ctx = { path = "/absolute/path/to/gitbutler-0.22.3/crates/but-ctx" }
+# but-db = { path = "/absolute/path/to/gitbutler-0.22.3/crates/but-db" }
+# but-graph = { path = "/absolute/path/to/gitbutler-0.22.3/crates/but-graph" }
+# but-path = { path = "/absolute/path/to/gitbutler-0.22.3/crates/but-path" }
+# but-workspace = { path = "/absolute/path/to/gitbutler-0.22.3/crates/but-workspace" }
+# gitbutler-filemonitor = { path = "/absolute/path/to/gitbutler-0.22.3/crates/gitbutler-filemonitor" }
+# gitbutler-project = { path = "/absolute/path/to/gitbutler-0.22.3/crates/gitbutler-project" }

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/gb-bridge", "crates/gb-gpui"]
+
+[workspace.package]
+edition = "2024"
+publish = false
+rust-version = "1.95"
+
+[workspace.dependencies]
+anyhow = "1"
+gpui = { package = "gpui-pre", version = "=0.3.8" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["font-kit"] }
+ely-gpui-component = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "cd365e92ea0c4467c439b8253963461ba0f6d155" }
+ns-ui = { git = "https://github.com/ngosangns/ns-gpui", rev = "e5f54d106ddd045969bc8f5a0c7e2b9e4d43b1c0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# GitButler 0.22.3, the same tag as the installed app. See UPSTREAM.md.
+but-api = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3", default-features = false }
+but-askpass = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+but-core = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+but-hunk-assignment = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+but-settings = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+but-ctx = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3", default-features = false }
+but-db = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+but-graph = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+but-path = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+but-rebase = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+but-workspace = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3", default-features = false }
+gitbutler-branch = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+gitbutler-filemonitor = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+gitbutler-project = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+gitbutler-watcher = { git = "https://github.com/gitbutlerapp/gitbutler", tag = "release/0.22.3" }
+gix = { version = "0.87.0", git = "https://github.com/GitoxideLabs/gitoxide", rev = "dda600d7ee29a6bda4cf1047d0d1782e76b16f98", default-features = false, features = ["sha1"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "chrono"] }
+tokio = { version = "1.50.0", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Copied exactly from GitButler release/0.22.3 Cargo.toml.
+[patch.crates-io]
+gix = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "dda600d7ee29a6bda4cf1047d0d1782e76b16f98" }
+git2 = { git = "https://github.com/gitbutlerapp/git2-rs", rev = "a87a7bb3f6843504339fe7434ee0732a3e968f3e" }

@@ -1,0 +1,21 @@
+[package]
+name = "gb-gpui"
+version = "0.22.3"
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+
+[[bin]]
+name = "gb-gpui"
+path = "src/main.rs"
+
+[features]
+devtools = ["ns-ui/devtools"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ely-gpui-component.workspace = true
+gb-bridge = { path = "../gb-bridge" }
+gpui.workspace = true
+ns-ui.workspace = true
+serde_json.workspace = true

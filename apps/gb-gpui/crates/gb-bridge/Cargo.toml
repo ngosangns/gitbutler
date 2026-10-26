@@ -1,0 +1,39 @@
+[package]
+name = "gb-bridge"
+version = "0.22.3"
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+but-api = { workspace = true, features = ["legacy"] }
+but-askpass.workspace = true
+but-core.workspace = true
+# `but-meta` (via `but-graph`) turns on `but-project-handle/legacy`, while
+# `but-gerrit` pulls `but-ctx` without that feature. Upstream `but-ctx` only
+# compiles when the two agree, so the library enables `legacy` directly.
+but-ctx = { workspace = true, features = ["legacy"] }
+but-db.workspace = true
+but-graph.workspace = true
+but-hunk-assignment.workspace = true
+but-path.workspace = true
+but-rebase.workspace = true
+but-settings.workspace = true
+but-workspace.workspace = true
+gitbutler-project.workspace = true
+gitbutler-watcher.workspace = true
+gix.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+but-core.workspace = true
+but-path.workspace = true
+but-workspace.workspace = true
+gitbutler-branch.workspace = true
+gitbutler-project.workspace = true
+gix.workspace = true
+tempfile = "3"
