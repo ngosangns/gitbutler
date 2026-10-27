@@ -60,7 +60,7 @@ pub fn shortcut_rows() -> &'static [Shortcut] {
         },
         Shortcut {
             tokens: &["cmd-shift-f"],
-            keys: "⌘⇧F",
+            keys: "⌘ Shift F",
             what: "Fetch remotes",
         },
         Shortcut {

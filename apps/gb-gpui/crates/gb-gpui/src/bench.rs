@@ -268,21 +268,6 @@ fn perf_bench_large() {
     report("workspace_tree_rows_cold", cold_tree);
     let cached_tree = median_ms(|| black_box(store.tree_rows()));
     report("workspace_tree_rows_cached", cached_tree);
-    let folder_marks = median_ms(|| {
-        let mut marked = 0usize;
-        for dir in 0..VISIBLE_ROWS {
-            if store.folder_fully_marked(&format!("dir_{dir:03}")) {
-                marked += 1;
-            }
-        }
-        black_box(marked);
-    });
-    report("workspace_folder_marks", folder_marks);
-    let folder_marks_cold = median_ms(|| {
-        let fresh = Store::seeded(Some(Arc::clone(&worktree)), None);
-        black_box(fresh.folder_fully_marked("dir_000"));
-    });
-    report("workspace_folder_marks_cold", folder_marks_cold);
     let summary = median_ms(|| black_box(store.commit_summary()));
     report("workspace_commit_summary", summary);
     let marked_hunks = store.marked_hunks.clone();
@@ -431,14 +416,7 @@ fn perf_bench_large() {
     for (name, value) in [
         (
             "workspace",
-            cached_slots
-                + cached_tree
-                + folder_marks
-                + summary
-                + assignment
-                + row_labels
-                + heading
-                + lookup,
+            cached_slots + cached_tree + summary + assignment + row_labels + heading + lookup,
         ),
         ("lanes", cached_lanes + commit_rows),
         ("detail", info),

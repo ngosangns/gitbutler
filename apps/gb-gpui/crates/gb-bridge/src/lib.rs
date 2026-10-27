@@ -222,13 +222,13 @@ impl FileChange {
         names
     }
 
-    /// Chip text: a lane name, `lane · N hunks`, `split`, or `Unassigned`.
+    /// Chip text: a lane name, `lane, N hunks`, `split`, or `Unassigned`.
     pub fn assignment_label(&self) -> String {
         let lanes = self.lanes();
         match lanes.as_slice() {
             [] => "Unassigned".to_string(),
             [lane] if self.hunks.len() <= 1 => (*lane).to_string(),
-            [lane] => format!("{lane} · {} hunks", self.hunks.len()),
+            [lane] => format!("{lane}, {} hunks", self.hunks.len()),
             _ => "split".to_string(),
         }
     }

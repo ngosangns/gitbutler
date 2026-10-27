@@ -352,7 +352,7 @@ impl Activity {
                 .last()
                 .map(|slot| slot.label.as_str())
                 .unwrap_or("Working…");
-            return Some(format!("{} in progress · {label}", spinning.len()));
+            return Some(format!("{} in progress: {label}", spinning.len()));
         }
         let now = self.now();
         self.latest
@@ -1261,7 +1261,7 @@ mod tests {
             activity
                 .strip_line()
                 .unwrap()
-                .contains("1 in progress · Pushing…")
+                .contains("1 in progress: Pushing…")
         );
         activity.succeed("push", "Pushed 2 commits.");
         assert!(matches!(activity.state("push"), OpState::Success { .. }));

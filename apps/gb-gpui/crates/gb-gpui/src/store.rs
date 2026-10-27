@@ -1149,8 +1149,7 @@ impl Store {
         self.folder_index().lookup(path)
     }
 
-    /// Every file under `folder`, in worktree order. Event-time callers only;
-    /// per-frame mark checks go through [`Store::folder_fully_marked`].
+    /// Every file under `folder`, in worktree order. Event-time callers only.
     pub fn folder_paths_vec(&self, folder: &str) -> Vec<String> {
         let index = self.folder_index();
         let mut files: Vec<usize> = index.files[index.range(folder).clone()].to_vec();
@@ -1163,19 +1162,6 @@ impl Store {
                 .collect(),
             None => Vec::new(),
         }
-    }
-
-    /// Whether every file under `folder` is marked. O(files in the folder),
-    /// no per-path allocation.
-    pub fn folder_fully_marked(&self, folder: &str) -> bool {
-        let index = self.folder_index();
-        let range = index.range(folder);
-        if range.is_empty() {
-            return false;
-        }
-        index.paths[range]
-            .iter()
-            .all(|path| self.marked.contains(path))
     }
 
     pub fn toggle_dir(&mut self, path: &str) {
@@ -1354,6 +1340,13 @@ impl Store {
         if !same {
             self.commit = None;
         }
+        let switching = !matches!(&self.side, SideFocus::Commit { sha } if *sha == resolved);
+        if switching {
+            self.shown = ShownFile::None;
+            self.diff_rows = Arc::new(Vec::new());
+            self.diff_loading = false;
+            self.diff_error = None;
+        }
         self.side = SideFocus::Commit {
             sha: resolved.clone(),
         };
@@ -1372,6 +1365,19 @@ impl Store {
             item.commit.is_none() && item.stack == stack_index && item.branch == branch_index
         }) {
             self.cursors[Pane::Branches.index()] = position;
+        }
+        let switching = !matches!(
+            &self.side,
+            SideFocus::Branch {
+                stack: old_stack,
+                branch: old_branch,
+            } if *old_stack == stack_index && *old_branch == branch_index
+        );
+        if switching {
+            self.shown = ShownFile::None;
+            self.diff_rows = Arc::new(Vec::new());
+            self.diff_loading = false;
+            self.diff_error = None;
         }
         self.side = SideFocus::Branch {
             stack: stack_index,
@@ -1561,15 +1567,17 @@ impl Store {
                     .file_index_by_path(path)
                     .and_then(|index| self.lane_label(index));
                 Some(match lane {
-                    Some(lane) if lane != "Unassigned" => format!("Uncommitted · {lane} · {path}"),
-                    _ => format!("Uncommitted · {path}"),
+                    Some(lane) if lane != "Unassigned" => {
+                        format!("Uncommitted change in {lane}: {path}")
+                    }
+                    _ => format!("Uncommitted change: {path}"),
                 })
             }
             ShownFile::Commit { sha, path } => {
                 let short = short7(sha);
                 Some(match self.branch_name_for(sha) {
-                    Some(name) => format!("Commit {short} · {name} · {path}"),
-                    None => format!("Commit {short} · {path}"),
+                    Some(name) => format!("Commit {short} in {name}: {path}"),
+                    None => format!("Commit {short}: {path}"),
                 })
             }
         }
@@ -2194,7 +2202,7 @@ impl Store {
         }
     }
 
-    fn branch_name_for(&self, sha: &str) -> Option<String> {
+    pub fn branch_name_for(&self, sha: &str) -> Option<String> {
         let (data_gen, workspace) = self.workspace_key();
         let key = (data_gen, workspace, sha.to_string());
         if self.derived.borrow().branch_name_key.as_ref() == Some(&key)
@@ -2281,7 +2289,7 @@ fn assignment_label_for(file: &FileChange) -> String {
     match lanes.as_slice() {
         [] => "Unassigned".to_string(),
         [lane] if file.hunks.len() <= 1 => (*lane).to_string(),
-        [lane] => format!("{lane} · {} hunks", file.hunks.len()),
+        [lane] => format!("{lane}, {} hunks", file.hunks.len()),
         _ => "split".to_string(),
     }
 }
@@ -3224,13 +3232,8 @@ mod tests {
             .collect()
     }
 
-    fn fully_marked_scan(store: &Store, folder: &str) -> bool {
-        let paths = paths_in_folder_scan(store.worktree.as_ref().expect("worktree"), folder);
-        !paths.is_empty() && paths.iter().all(|path| store.marked.contains(path))
-    }
-
     #[test]
-    fn folder_mark_helpers_match_a_linear_scan_including_nested_folders() {
+    fn folder_paths_match_a_linear_scan_including_nested_folders() {
         let files = vec![
             change("src/b.rs", 1, 0),
             change("src/sub/c.rs", 2, 0),
@@ -3259,23 +3262,7 @@ mod tests {
                 paths_in_folder_scan(store.worktree.as_ref().unwrap(), folder),
                 "{folder}"
             );
-            assert_eq!(
-                store.folder_fully_marked(folder),
-                fully_marked_scan(&store, folder),
-                "{folder}"
-            );
         }
-        // Nothing marked, then everything under src, then a partial mark.
-        for path in ["src/b.rs", "src/sub/c.rs", "src/sub/deep/d.rs"] {
-            store.mark_click(path, false);
-        }
-        assert!(store.folder_fully_marked("src"));
-        assert!(store.folder_fully_marked("src/sub"));
-        assert!(store.folder_fully_marked("src/sub/deep"));
-        assert!(!store.folder_fully_marked("zzz"));
-        store.mark_click("src/sub/c.rs", false);
-        assert!(!store.folder_fully_marked("src/sub"));
-        assert!(store.folder_fully_marked("src/sub/deep"));
         // A replaced worktree refreshes the index (no stale folders).
         let replacement = vec![change("other/e.rs", 1, 0)];
         store.worktree = Some(Arc::new(WorktreeView {
@@ -3287,7 +3274,6 @@ mod tests {
             paths_in_folder_scan(store.worktree.as_ref().unwrap(), "other")
         );
         assert!(store.folder_paths_vec("src").is_empty());
-        assert!(!store.folder_fully_marked("src"));
     }
 
     #[test]

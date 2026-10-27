@@ -393,7 +393,7 @@ impl Store {
             if self.composer.lane_name.trim().is_empty() {
                 "New lane".to_string()
             } else {
-                format!("New lane · {}", self.composer.lane_name.trim())
+                format!("New lane: {}", self.composer.lane_name.trim())
             }
         } else {
             self.resolved_lane()
@@ -410,7 +410,7 @@ impl Store {
             .map(|line| line.chars().count())
             .max()
             .unwrap_or(0);
-        format!("Title {title}/50 · body {body}/72")
+        format!("Title {title}/50, body {body}/72")
     }
 
     pub fn title_over(&self) -> bool {
@@ -478,11 +478,11 @@ impl Store {
                     if hunks == 1 { "" } else { "s" }
                 );
             }
-            return format!("1 file · {path}");
+            return format!("1 file: {path}");
         }
         if hunks > 0 {
             return format!(
-                "{} files · {hunks} hunk{}",
+                "{} files, {hunks} hunk{}",
                 specs.len(),
                 if hunks == 1 { "" } else { "s" }
             );
@@ -634,14 +634,14 @@ impl Store {
                 format!("Move {}", paths[0])
             }
             Some(MenuKind::MoveFiles { paths }) => format!("Move {} files", paths.len()),
-            Some(MenuKind::MoveHunk { path, .. }) => format!("Move hunk · {path}"),
+            Some(MenuKind::MoveHunk { path, .. }) => format!("Move hunk in {path}"),
             Some(MenuKind::MoveCommit { sha }) => format!("Move {}", short7(sha)),
             Some(MenuKind::CommitActions { sha }) => format!("Commit {}", short7(sha)),
             Some(MenuKind::ComposerLane) => "Commit to".to_string(),
             Some(MenuKind::AmendInto) => "Amend into".to_string(),
             Some(MenuKind::FileActions { paths }) if paths.len() == 1 => paths[0].clone(),
             Some(MenuKind::FileActions { paths }) => format!("{} files", paths.len()),
-            Some(MenuKind::HunkActions { path, .. }) => format!("Hunk · {path}"),
+            Some(MenuKind::HunkActions { path, .. }) => format!("Hunk in {path}"),
             Some(MenuKind::LaneActions { name } | MenuKind::ListedBranch { name }) => name.clone(),
             None => String::new(),
         }
@@ -3091,7 +3091,7 @@ mod tests {
         store.composer.title = "Show the lane name".to_string();
         store.composer.lane = Some("lane-a".to_string());
         assert!(store.commit_block().is_none());
-        assert_eq!(store.commit_summary(), "3 files · 1 hunk");
+        assert_eq!(store.commit_summary(), "3 files, 1 hunk");
         let specs = store.commit_specs();
         assert!(
             specs

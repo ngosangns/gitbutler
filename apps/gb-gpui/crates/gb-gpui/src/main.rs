@@ -2,13 +2,16 @@
 //! installed app's files. A live window runs GitButler's watcher, which writes
 //! hunk assignments the same way GitButler does.
 //!
-//! ns-ui has no GitButler tint. The accent is Hearth blue until one is added there.
+//! The palette is local (`theme`): ns-ui has no GitButler tint, so the window
+//! builds its own and points Ely at it before the first frame.
 
 mod audit;
 #[cfg(test)]
 mod bench;
 mod perf_harness;
 mod store;
+mod theme;
+mod ui;
 
 use perf_harness::{PerfRun, RenderClock};
 
@@ -20,17 +23,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ely_gpui_component::buttons::{ButtonVariant, IconButton};
-use ely_gpui_component::layout::ScrollArea;
-use ely_gpui_component::primitives::{IconName, Tooltip};
+use ely_gpui_component::layout::{ScrollArea, Scrollbar};
+use ely_gpui_component::primitives::{Icon, IconName, Tooltip};
 use ely_gpui_component::shell::StatusBar;
-use ely_gpui_component::theme::{ActiveTheme, ControlSize, Elevation};
+use ely_gpui_component::theme::{ActiveTheme, ControlSize, Elevation, IconSize};
 use gb_bridge::{
     Backend, BridgeEvent, CommitDetails, CommitFile, CommitSummary, DiffRequest, FakeBackend,
     FileChange, FileStatus, ForcePush, InProcessBackend, StackSummary,
 };
 use gpui::{
-    App, ClickEvent, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollHandle,
+    App, Axis, ClickEvent, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollHandle,
     ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window, div, point, prelude::*,
     px, uniform_list,
 };
@@ -51,7 +54,6 @@ struct ColumnDrag {
 }
 
 fn main() {
-    ns_ui::use_tint(ns_ui::Tint::Hearth);
     let backend: Arc<dyn Backend> = if std::env::var_os("GB_GPUI_FAKE").is_some() {
         Arc::new(FakeBackend::demo())
     } else {
@@ -125,6 +127,7 @@ struct GbWindow {
 
 impl GbWindow {
     fn new(backend: Arc<dyn Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        theme::adopt_ely_theme(cx);
         let (event_tx, events) = mpsc::channel();
         let (askpass_tx, askpass_rx) = mpsc::channel();
         let focus = cx.focus_handle();
@@ -1016,7 +1019,7 @@ impl Render for GbWindow {
         if self.perf.borrow().recording {
             self.kick_perf_draw(cx);
         }
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let viewport = window.viewport_size().width.as_f32();
         self.viewport_width = viewport;
         self.laid_out = store::column_pixels(self.store.column_fractions, viewport);
@@ -1046,11 +1049,21 @@ impl Render for GbWindow {
             .child(self.strip(cx))
             .child(self.body(cx))
             .child(
-                StatusBar::new().left(
-                    div()
-                        .text_color(theme.muted)
-                        .child(status_line(&self.store, self.preview)),
-                ),
+                StatusBar::new()
+                    .left(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().w(px(2.)).h(px(12.)).bg(theme.accent))
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .text_color(theme.muted)
+                                    .child(status_line(&self.store, self.preview)),
+                            ),
+                    )
+                    .right(div().text_xs().text_color(theme.muted).child("? shortcuts")),
             )
             .when(self.store.project_menu, |root| {
                 root.child(self.menu_catcher(cx))
@@ -1078,7 +1091,8 @@ impl Render for GbWindow {
                 |root| root.child(self.remote_confirm(cx)),
             )
             .when(self.store.settings.open, |root| {
-                root.child(self.settings_page(cx))
+                root.child(self.settings_scrim())
+                    .child(self.settings_page(cx))
             })
             .when(
                 toasts_open
@@ -1118,7 +1132,7 @@ impl GbWindow {
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         div()
             .flex_none()
             .h(px(44.))
@@ -1137,9 +1151,10 @@ impl GbWindow {
                     .items_center()
                     .gap_3()
                     .overflow_hidden()
-                    .child(div().flex_none().text_sm().child("gb-gpui"))
+                    .child(ui::wordmark(&theme))
+                    .child(ui::crumb(&theme))
                     .child(self.project_button(cx))
-                    .child(self.mode_chip())
+                    .when(self.preview, |left| left.child(self.mode_chip()))
                     .child(self.page_tabs(cx)),
             )
             .child(
@@ -1147,19 +1162,20 @@ impl GbWindow {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(self.fetch_button(cx))
+                    .gap_1()
                     .child(self.fetch_status())
+                    .child(self.fetch_button(cx))
                     .child(self.undo_button(cx))
                     .child(self.settings_button(cx))
                     .child(
                         div()
                             .id("keyboard-tip")
-                            .tooltip(Tooltip::text("Show keyboard shortcuts"))
-                            .child(ns_ui::quiet_button(
+                            .tooltip(Tooltip::text("Keyboard shortcuts"))
+                            .child(ui::icon_action(
                                 "keyboard",
-                                "keyboard",
-                                "Keyboard",
+                                IconName::Keyboard,
+                                "Keyboard shortcuts",
+                                false,
                                 cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.store.toggle_help();
                                     cx.notify();
@@ -1170,12 +1186,13 @@ impl GbWindow {
                         div()
                             .id("refresh-tip")
                             .tooltip(Tooltip::text(
-                                "Re-read projects, lanes, and uncommitted changes",
+                                "Re-read projects, lanes, and uncommitted changes (⌘R)",
                             ))
-                            .child(ns_ui::button(
+                            .child(ui::icon_action(
                                 "refresh",
-                                "refresh",
-                                "Refresh",
+                                IconName::RefreshCw,
+                                "Refresh (⌘R)",
+                                false,
                                 cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx)),
                             )),
                     ),
@@ -1209,21 +1226,22 @@ impl GbWindow {
             "This build has no forge account and no AI provider. Publish stays off until sign-in exists, and Suggest message explains how to set a provider up."
         };
         div()
-            .id("m6-chip")
+            .id("preview-chip")
             .flex_none()
             .tooltip(Tooltip::text(tip))
-            .child(ns_ui::chip("M6 · settings", Tone::Accent))
+            .child(ns_ui::chip("Preview data", Tone::Neutral))
     }
 
     fn settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("settings-tip")
             .flex_none()
-            .tooltip(Tooltip::text("Open settings (,)"))
-            .child(ns_ui::quiet_button(
+            .tooltip(Tooltip::text("Settings (,)"))
+            .child(ui::icon_action(
                 "settings",
-                "settings",
-                "Settings",
+                IconName::Settings,
+                "Settings (,)",
+                false,
                 cx.listener(|this, _: &ClickEvent, _, cx| {
                     let effect = this.store.toggle_settings();
                     this.activate(effect, cx);
@@ -1265,26 +1283,28 @@ impl GbWindow {
         tip: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let on = self.store.app_page() == page;
         div()
             .id(SharedString::from(format!("page-{}", page.name())))
-            .h(px(24.))
+            .h(px(44.))
             .px_2()
             .flex_none()
-            .rounded_md()
             .flex()
             .items_center()
             .text_xs()
             .cursor_pointer()
-            .border_1()
+            .border_b_2()
             .border_color(if on {
                 gpui::Hsla::from(theme.accent)
             } else {
-                gpui::Hsla::from(theme.border)
+                gpui::Hsla::from(theme.panel)
             })
-            .when(on, |tab| tab.bg(theme.selected).text_color(theme.accent))
-            .when(!on, |tab| tab.text_color(theme.text))
+            .when(on, |tab| tab.text_color(theme.accent))
+            .when(!on, |tab| {
+                tab.text_color(theme.muted)
+                    .hover(move |style| style.text_color(theme.text))
+            })
             .tooltip(Tooltip::text(tip))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.switch_page(page, cx);
@@ -1295,7 +1315,6 @@ impl GbWindow {
     fn fetch_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let spinning = self.store.activity.spinner_on("fetch");
         let starting = self.store.remote.fetching && !spinning;
-        let label = if spinning { "Fetching…" } else { "Fetch" };
         let tip = if spinning {
             pace_sentence("fetch", "Fetching from the remote.")
         } else if starting {
@@ -1306,11 +1325,12 @@ impl GbWindow {
         div()
             .id("fetch-tip")
             .flex_none()
-            .tooltip(Tooltip::text(tip))
-            .child(ns_ui::button(
+            .tooltip(Tooltip::text(tip.clone()))
+            .child(ui::icon_action(
                 "fetch",
-                "download",
-                label,
+                IconName::Download,
+                tip,
+                spinning,
                 cx.listener(|this, _: &ClickEvent, _, cx| {
                     if this.store.remote.fetching {
                         return;
@@ -1323,7 +1343,7 @@ impl GbWindow {
     }
 
     fn fetch_status(&self) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let text = self.store.remote.status_line();
         let warn = self.store.remote.fetch_error.is_some();
         div()
@@ -1353,73 +1373,35 @@ impl GbWindow {
         let caption = locked
             .map(str::to_string)
             .unwrap_or_else(|| caption.unwrap_or_else(|| "Nothing to undo".to_string()));
-        let shown = if enabled {
-            truncate_chars(&caption, 28)
+        let tip = if enabled {
+            format!("Undo {caption} (⌘Z)")
         } else {
-            "Undo".to_string()
+            caption
         };
-        let theme = ns_ui::theme();
         div()
             .id("undo-tip")
             .flex_none()
-            .max_w(px(240.))
-            .tooltip(Tooltip::text(caption.clone()))
-            .child(if enabled {
-                ns_ui::quiet_button(
-                    "undo",
-                    "restart",
-                    shown,
-                    cx.listener(|this, _: &ClickEvent, _, cx| {
-                        let effect = this.store.request_undo();
-                        this.activate(effect, cx);
-                        cx.notify();
-                    }),
-                )
-                .into_any_element()
-            } else {
-                div()
-                    .id("undo-disabled")
-                    .px_2()
-                    .py(px(4.))
-                    .rounded_md()
-                    .text_sm()
-                    .text_color(theme.muted)
-                    .child("Undo")
-                    .into_any_element()
-            })
+            .tooltip(Tooltip::text(tip.clone()))
+            .child(ui::icon_action(
+                "undo",
+                IconName::RotateCcw,
+                tip,
+                !enabled,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    let effect = this.store.request_undo();
+                    this.activate(effect, cx);
+                    cx.notify();
+                }),
+            ))
     }
 
     fn strip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The old strip repeated the status bar. Only an active commit edit
+        // needs its own bar, because it carries the two ways out.
         if self.store.pages.editing() {
             return self.edit_strip(cx);
         }
-        let theme = ns_ui::theme();
-        let text = self.store.strip_text();
-        let warn = self.store.banner().is_some() || self.store.exclusive == Some(false);
-        let color = if warn { theme.warn } else { theme.muted };
-        div()
-            .id("status-strip")
-            .flex_none()
-            .h(px(28.))
-            .px_3()
-            .flex()
-            .items_center()
-            .overflow_hidden()
-            .bg(theme.panel)
-            .border_b_1()
-            .border_color(theme.border)
-            .when(!text.is_empty(), |strip| {
-                strip.tooltip(Tooltip::text(text.clone()))
-            })
-            .child(
-                div()
-                    .min_w(px(0.))
-                    .text_xs()
-                    .text_color(color)
-                    .truncate()
-                    .child(text),
-            )
-            .into_any_element()
+        div().into_any_element()
     }
 
     fn body(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1464,8 +1446,8 @@ impl GbWindow {
             .child(self.branches_column(cx))
     }
 
-    fn column(&self, index: usize, active: bool, child: impl IntoElement) -> impl IntoElement {
-        let theme = ns_ui::theme();
+    fn column(&self, index: usize, _active: bool, child: impl IntoElement) -> impl IntoElement {
+        let theme = theme::current();
         let width = self.laid_out.get(index).copied().unwrap_or(0.0);
         div()
             .w(px(width))
@@ -1477,25 +1459,23 @@ impl GbWindow {
             .flex_col()
             .overflow_hidden()
             .bg(theme.editor)
-            .border_1()
-            .border_color(if active {
-                gpui::Hsla::from(theme.accent)
-            } else {
-                gpui::Hsla::from(theme.border)
-            })
             .child(child)
     }
 
     fn column_handle(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme::current();
         div()
             .id(SharedString::from(format!("col-handle-{index}")))
             .w(px(store::HANDLE_WIDTH))
             .h_full()
             .flex_none()
+            .flex()
+            .justify_center()
             .cursor_col_resize()
             .tooltip(Tooltip::text(
                 "Drag to resize columns. Double-click to reset.",
             ))
+            .child(div().w(px(1.)).h_full().bg(theme.border))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1549,37 +1529,31 @@ impl GbWindow {
     fn column_header(
         &self,
         id: &'static str,
+        active: bool,
         title: String,
         tip: String,
         trailing: impl IntoElement,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         div()
             .flex_none()
-            .h(px(40.))
-            .px_2()
+            .h(px(36.))
+            .px_3()
             .flex()
             .items_center()
             .gap_2()
             .overflow_hidden()
             .border_b_1()
             .border_color(theme.border)
-            .bg(theme.panel)
-            .child(
-                div()
-                    .w(px(3.))
-                    .h(px(14.))
-                    .flex_none()
-                    .rounded_sm()
-                    .bg(theme.accent),
-            )
+            .child(ui::rail(&theme, active))
             .child(
                 div()
                     .id(id)
                     .flex_1()
                     .min_w(px(0.))
-                    .text_sm()
+                    .text_xs()
                     .truncate()
+                    .text_color(if active { theme.text } else { theme.muted })
                     .tooltip(Tooltip::text(tip))
                     .child(title),
             )
@@ -1595,8 +1569,10 @@ impl GbWindow {
     }
 
     fn uncommitted_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = theme::current();
         let header = self.column_header(
             "uncommitted-title",
+            self.store.pane == Pane::Uncommitted,
             "Uncommitted changes".to_string(),
             "Uncommitted changes".to_string(),
             self.view_toggle(cx),
@@ -1614,9 +1590,10 @@ impl GbWindow {
             div()
                 .flex_1()
                 .min_h(px(0.))
-                .child(ns_ui::loading_pane(
+                .child(ui::loading_pane(
                     "uncommitted-loading",
                     "Reading changes",
+                    &theme,
                 ))
                 .into_any_element()
         } else if pending && no_tree {
@@ -1719,11 +1696,12 @@ impl GbWindow {
         paths: Arc<[String]>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let name = group.name.clone();
         let tip = format!("Actions for {name}");
         div()
             .id(SharedString::from(format!("group-{name}")))
+            .w_full()
             .px_2()
             .pt_2()
             .pb(px(2.))
@@ -1767,7 +1745,7 @@ impl GbWindow {
     fn virtual_files(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
         let painted = Rc::clone(&self.painted);
-        match self.store.view {
+        let list = match self.store.view {
             ViewMode::List => {
                 let slots = self.store.file_slots();
                 let count = slots.len();
@@ -1810,7 +1788,18 @@ impl GbWindow {
                 .size_full()
                 .into_any_element()
             }
-        }
+        };
+        div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.))
+            .child(list)
+            .child(Scrollbar::new(
+                "file-scrollbar",
+                &self.file_scroll.0.borrow().base_handle,
+                Axis::Vertical,
+            ))
+            .into_any_element()
     }
 
     fn paint_file_slot(&self, slot: &store::FileSlot, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1880,27 +1869,29 @@ impl GbWindow {
         label: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let selected = self.store.cursor(Pane::Uncommitted) == flat;
         let focused = self.store.pane == Pane::Uncommitted && selected;
         let path = file.path.clone();
         let label = label.to_string();
-        let tip = format!("{path} · {label}. Shift-click selects a range.");
+        let tip = format!("{path}. {label}. Ctrl-click marks it. Shift-click marks a range.");
         let marked = self.store.file_marked(&path);
         div()
             .id(SharedString::from(format!("file-{path}")))
-            .mx_2()
-            .my(px(1.))
+            .w_full()
             .px_2()
-            .min_h(px(28.))
-            .rounded_md()
+            .min_h(px(30.))
             .flex()
             .items_center()
             .gap_1()
             .overflow_hidden()
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(focused, &theme))
+            .border_l_2()
+            .border_color(if focused {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.editor)
+            })
             .when(selected, |row| row.bg(theme.selected))
             .when(!selected, |row| {
                 row.hover(move |style| style.bg(theme.hover))
@@ -1926,8 +1917,14 @@ impl GbWindow {
                 cx.listener(move |this, event: &ClickEvent, _, cx| {
                     this.store.pane = Pane::Uncommitted;
                     this.store.set_cursor(Pane::Uncommitted, flat);
-                    if event.modifiers().shift {
+                    let mods = event.modifiers();
+                    if mods.shift {
                         this.store.mark_click(&path, true);
+                        cx.notify();
+                        return;
+                    }
+                    if mods.control || mods.platform {
+                        this.store.mark_click(&path, false);
                         cx.notify();
                         return;
                     }
@@ -1936,23 +1933,6 @@ impl GbWindow {
                     cx.notify();
                 })
             })
-            .child(inclusion_box(
-                SharedString::from(format!("mark-file-{path}")),
-                marked,
-                format!(
-                    "Select {path}. Shift-click selects a range. Space does this from the keyboard."
-                ),
-                {
-                    let path = file.path.clone();
-                    cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.store.pane = Pane::Uncommitted;
-                        this.store.set_cursor(Pane::Uncommitted, flat);
-                        this.store.mark_click(&path, event.modifiers().shift);
-                        cx.notify();
-                    })
-                },
-            ))
             .child(status_mark(file.status))
             .child(
                 div()
@@ -1960,11 +1940,12 @@ impl GbWindow {
                     .min_w(px(0.))
                     .font_family(ns_ui::CODE_FONT)
                     .text_xs()
+                    .when(marked, |row| row.text_color(gpui::Hsla::from(theme.accent)))
                     .truncate()
                     .child(file.path.clone()),
             )
             .child(counts(file.additions, file.deletions))
-            .child(self.assignment_chip(format!("assign-list-{path}"), &label))
+            .child(self.assignment_dot(format!("assign-list-{path}"), &label))
             .when_some(self.store.activity.row_label(&path), |row, tip| {
                 row.child(wait_slot(
                     SharedString::from(format!("file-busy-{path}")),
@@ -1987,26 +1968,28 @@ impl GbWindow {
             ))
     }
 
-    fn assignment_chip(&self, id: String, label: &str) -> impl IntoElement {
-        let tone = if label == "split" {
-            Tone::Warn
-        } else if label == "Unassigned" {
-            Tone::Neutral
+    fn assignment_dot(&self, id: String, label: &str) -> impl IntoElement {
+        let theme = theme::current();
+        let (color, tip) = if label == "split" {
+            (
+                theme.warn,
+                "Hunks in this file are assigned to more than one lane".to_string(),
+            )
+        } else if label == "Unassigned" || label.is_empty() {
+            (
+                theme.muted,
+                "No lane owns the hunks in this file".to_string(),
+            )
         } else {
-            Tone::Accent
-        };
-        let tip = if label == "split" {
-            "Hunks in this file are assigned to more than one lane".to_string()
-        } else if label == "Unassigned" {
-            "No lane owns the hunks in this file".to_string()
-        } else {
-            format!("Assigned to {label}")
+            (theme.accent, format!("Assigned to {label}"))
         };
         div()
             .id(SharedString::from(id))
             .flex_none()
+            .size(px(16.))
+            .rounded_full()
+            .bg(color)
             .tooltip(Tooltip::text(tip))
-            .child(ns_ui::chip(label.to_string(), tone))
     }
 
     fn tree_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -2027,7 +2010,7 @@ impl GbWindow {
     }
 
     fn folder_row(&self, index: usize, row: &TreeRow, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let selected = self.store.cursor(Pane::Uncommitted) == index;
         let focused = self.store.pane == Pane::Uncommitted && selected;
         let path = row.path.clone();
@@ -2036,29 +2019,31 @@ impl GbWindow {
         let additions = row.additions;
         let deletions = row.deletions;
         let depth = row.depth;
-        let mark = if row.expanded { "▾" } else { "▸" };
         let action = if row.expanded { "Collapse" } else { "Expand" };
-        let folder_on = self.folder_fully_marked(&path);
         div()
             .id(SharedString::from(format!("tree-{index}")))
-            .mx_2()
-            .my(px(1.))
-            .pl(px(8. + depth as f32 * 12.))
+            .w_full()
+            .pl(px(10. + depth as f32 * 12.))
             .pr_2()
-            .min_h(px(28.))
-            .rounded_md()
+            .min_h(px(30.))
             .flex()
             .items_center()
             .gap_2()
             .overflow_hidden()
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(focused, &theme))
+            .border_l_2()
+            .border_color(if focused {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.editor)
+            })
             .when(selected, |line| line.bg(theme.selected))
             .when(!selected, |line| {
                 line.hover(move |style| style.bg(theme.hover))
             })
-            .tooltip(Tooltip::text(format!("{action} {path} · {count} files")))
+            .tooltip(Tooltip::text(format!(
+                "{path}. {count} files. Click the arrow to {action}."
+            )))
             .on_mouse_down(MouseButton::Right, {
                 let path = path.clone();
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2078,23 +2063,38 @@ impl GbWindow {
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.store.pane = Pane::Uncommitted;
                 this.store.set_cursor(Pane::Uncommitted, index);
-                let effect = this.store.open_current();
-                this.activate(effect, cx);
                 cx.notify();
             }))
-            .child(inclusion_box(
-                SharedString::from(format!("mark-folder-{index}")),
-                folder_on,
-                format!("Select every file in {path}. Space does this from the keyboard."),
-                cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.store.pane = Pane::Uncommitted;
-                    this.store.set_cursor(Pane::Uncommitted, index);
-                    let _ = this.store.apply_key("space");
-                    cx.notify();
-                }),
-            ))
-            .child(div().flex_none().text_color(theme.muted).child(mark))
+            .child(
+                div()
+                    .id(SharedString::from(format!("tree-chev-{index}")))
+                    .flex_none()
+                    .size(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover))
+                    .tooltip(Tooltip::text(format!("{action} {path}")))
+                    .on_click(cx.listener({
+                        let path = path.clone();
+                        move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.store.toggle_dir(&path);
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        Icon::new(if row.expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::Sm)
+                        .color(gpui::Hsla::from(theme.muted)),
+                    ),
+            )
             .child(
                 div()
                     .flex_1()
@@ -2140,7 +2140,7 @@ impl GbWindow {
         row: &TreeRow,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let selected = self.store.cursor(Pane::Uncommitted) == index;
         let focused = self.store.pane == Pane::Uncommitted && selected;
         let file_index = row.file.unwrap_or(0);
@@ -2160,23 +2160,25 @@ impl GbWindow {
             .store
             .lane_label(file_index)
             .unwrap_or_else(|| "Unassigned".to_string());
-        let tip = format!("{path} · {label}. Shift-click selects a range.");
+        let tip = format!("{path}. {label}. Ctrl-click marks it. Shift-click marks a range.");
         let marked = self.store.file_marked(&path);
         div()
             .id(SharedString::from(format!("tree-{index}")))
-            .mx_2()
-            .my(px(1.))
-            .pl(px(8. + depth as f32 * 12.))
+            .w_full()
+            .pl(px(10. + depth as f32 * 12.))
             .pr_2()
-            .min_h(px(28.))
-            .rounded_md()
+            .min_h(px(30.))
             .flex()
             .items_center()
             .gap_2()
             .overflow_hidden()
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(focused, &theme))
+            .border_l_2()
+            .border_color(if focused {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.editor)
+            })
             .when(selected, |line| line.bg(theme.selected))
             .when(!selected, |line| {
                 line.hover(move |style| style.bg(theme.hover))
@@ -2202,8 +2204,14 @@ impl GbWindow {
                 cx.listener(move |this, event: &ClickEvent, _, cx| {
                     this.store.pane = Pane::Uncommitted;
                     this.store.set_cursor(Pane::Uncommitted, index);
-                    if event.modifiers().shift {
+                    let mods = event.modifiers();
+                    if mods.shift {
                         this.store.mark_click(&path, true);
+                        cx.notify();
+                        return;
+                    }
+                    if mods.control || mods.platform {
+                        this.store.mark_click(&path, false);
                         cx.notify();
                         return;
                     }
@@ -2212,23 +2220,6 @@ impl GbWindow {
                     cx.notify();
                 })
             })
-            .child(inclusion_box(
-                SharedString::from(format!("mark-tree-{index}")),
-                marked,
-                format!(
-                    "Select {path}. Shift-click selects a range. Space does this from the keyboard."
-                ),
-                {
-                    let path = path.clone();
-                    cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.store.pane = Pane::Uncommitted;
-                        this.store.set_cursor(Pane::Uncommitted, index);
-                        this.store.mark_click(&path, event.modifiers().shift);
-                        cx.notify();
-                    })
-                },
-            ))
             .child(status_mark(status))
             .child(
                 div()
@@ -2236,11 +2227,12 @@ impl GbWindow {
                     .min_w(px(0.))
                     .font_family(ns_ui::CODE_FONT)
                     .text_xs()
+                    .when(marked, |row| row.text_color(gpui::Hsla::from(theme.accent)))
                     .truncate()
                     .child(name),
             )
             .child(counts(additions, deletions))
-            .child(self.assignment_chip(format!("assign-tree-{file_index}"), &label))
+            .child(self.assignment_dot(format!("assign-tree-{file_index}"), &label))
             .when_some(self.store.activity.row_label(&path), |row, tip| {
                 row.child(wait_slot(
                     SharedString::from(format!("tree-busy-{index}")),
@@ -2264,19 +2256,142 @@ impl GbWindow {
     }
 
     fn changes_column(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        self.column(1, self.store.pane == Pane::Changes, self.changes_body(cx))
+        let active = match self.store.pane {
+            Pane::Changes => true,
+            Pane::Detail => self.store.detail_open(),
+            _ => false,
+        };
+        self.column(1, active, self.middle_body(cx))
+    }
+
+    /// The middle column: a focused commit or branch takes it over, otherwise
+    /// it stays the diff view.
+    fn middle_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match &self.store.side {
+            SideFocus::None => self.changes_body(cx),
+            _ => self.detail_middle(cx),
+        }
+    }
+
+    /// Detail in the middle column: full height, or the top 40% above a diff
+    /// pane that takes 60% of the column while a file diff is open.
+    fn detail_middle(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = theme::current();
+        let detail = self.detail_pane(cx);
+        if !self.diff_pane_open() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(theme.panel)
+                .child(detail)
+                .into_any_element();
+        }
+        div()
+            .size_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .bg(theme.panel)
+                    .child(detail),
+            )
+            .child(self.file_diff_pane(cx))
+            .into_any_element()
+    }
+
+    /// The bottom diff pane shows the open file while a commit or branch is
+    /// focused; a diff of another commit is stale and stays hidden.
+    fn diff_pane_open(&self) -> bool {
+        match (&self.store.side, &self.store.shown) {
+            (SideFocus::Commit { sha }, ShownFile::Commit { sha: shown_sha, .. }) => {
+                sha == shown_sha
+            }
+            (SideFocus::Commit { .. } | SideFocus::Branch { .. }, ShownFile::Worktree { .. }) => {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The bottom pane of the middle column: 60% of the column with the open
+    /// file's diff under a slim header.
+    fn file_diff_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme::current();
+        let title = self
+            .store
+            .changes_heading()
+            .unwrap_or_else(|| "Changes".to_string());
+        div()
+            .h(gpui::relative(0.6))
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.editor)
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(32.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .id("file-diff-title")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .truncate()
+                            .text_color(theme.muted)
+                            .tooltip(Tooltip::text(title.clone()))
+                            .child(title),
+                    ),
+            )
+            .child(self.diff_section(cx))
     }
 
     fn changes_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let heading = self.store.changes_heading();
         let title = heading.clone().unwrap_or_else(|| "Changes".to_string());
         let tip = heading.unwrap_or_else(|| "Changes".to_string());
-        let header = self.column_header("changes-title", title, tip, div());
-        let body = if self.store.activity.surface_busy(store::Surface::Diff) {
+        let header = self.column_header(
+            "changes-title",
+            self.store.pane == Pane::Changes,
+            title,
+            tip,
+            div(),
+        );
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(header)
+            .child(self.diff_section(cx))
+            .into_any_element()
+    }
+
+    fn diff_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = theme::current();
+        if self.store.activity.surface_busy(store::Surface::Diff) {
             div()
                 .flex_1()
                 .min_h(px(0.))
-                .child(ns_ui::loading_pane("diff-loading", "Reading the diff"))
+                .child(ui::loading_pane("diff-loading", "Reading the diff", &theme))
                 .into_any_element()
         } else if self.store.activity.surface_pending(store::Surface::Diff)
             && matches!(self.store.shown, ShownFile::None)
@@ -2295,7 +2410,7 @@ impl GbWindow {
                         .min_w(px(0.))
                         .whitespace_normal()
                         .text_sm()
-                        .text_color(ns_ui::theme().muted)
+                        .text_color(theme::current().muted)
                         .tooltip(Tooltip::text(
                             "Nothing open. Pick a file on the left, or a commit on the right, to read its diff.",
                         ))
@@ -2306,15 +2421,7 @@ impl GbWindow {
                 .into_any_element()
         } else {
             self.diff_body(cx)
-        };
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .child(header)
-            .child(body)
-            .into_any_element()
+        }
     }
 
     fn diff_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2377,6 +2484,7 @@ impl GbWindow {
         let painted = Rc::clone(&self.painted);
         let entity = cx.entity();
         div()
+            .relative()
             .flex_1()
             .min_h(px(0.))
             .flex()
@@ -2442,67 +2550,38 @@ impl GbWindow {
                     }),
                 )))
             })
+            .child(Scrollbar::new(
+                "diff-scrollbar",
+                &self.diff_scroll.0.borrow().base_handle,
+                Axis::Vertical,
+            ))
             .into_any_element()
     }
 
     fn branches_column(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = matches!(self.store.pane, Pane::Branches | Pane::Detail);
-        self.column(2, active, self.branches_body(cx))
+        self.column(2, self.store.pane == Pane::Branches, self.branches_body(cx))
     }
 
     fn branches_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let header = self.column_header(
             "branches-title",
+            self.store.pane == Pane::Branches,
             "Branches".to_string(),
             "Branches".to_string(),
             self.upstream_chip(cx),
         );
-        if !self.store.detail_open() {
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .child(header)
-                .child(self.branches_scroll(cx))
-                .into_any_element();
-        }
-        // Two equal flex children, so the detail pane is half the column.
-        // The column header stays in the top half. This split is the only jump.
-        let theme = ns_ui::theme();
         div()
             .size_full()
-            .min_h(px(0.))
             .flex()
             .flex_col()
             .overflow_hidden()
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(header)
-                    .child(self.branches_scroll(cx)),
-            )
-            .child(
-                div()
-                    .id("branch-detail")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .bg(theme.panel)
-                    .child(self.detail_pane(cx)),
-            )
+            .child(header)
+            .child(self.branches_scroll(cx))
             .into_any_element()
     }
 
     fn branches_scroll(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme::current();
         if self
             .store
             .activity
@@ -2511,7 +2590,11 @@ impl GbWindow {
             return div()
                 .flex_1()
                 .min_h(px(0.))
-                .child(ns_ui::loading_pane("branches-loading", "Reading branches"))
+                .child(ui::loading_pane(
+                    "branches-loading",
+                    "Reading branches",
+                    &theme,
+                ))
                 .into_any_element();
         }
         if self
@@ -2567,15 +2650,7 @@ impl GbWindow {
             .vertical()
             .flex_1()
             .min_h(px(0.))
-            .child(
-                div()
-                    .w_full()
-                    .p_2()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(body),
-            )
+            .child(div().w_full().flex().flex_col().children(body))
             .into_any_element()
     }
 
@@ -2671,7 +2746,8 @@ impl GbWindow {
         row_index: &mut usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
+        let start = *row_index;
         let mut children: Vec<gpui::AnyElement> = Vec::new();
         for branch in &stack.branches {
             if *row_index >= rows.len() {
@@ -2695,16 +2771,22 @@ impl GbWindow {
                 *row_index += 1;
             }
         }
+        let cursor = self.store.cursor(Pane::Branches);
+        let on = cursor >= start && cursor < *row_index;
         div()
-            .p_2()
-            .rounded_md()
-            .bg(theme.raised)
-            .border_1()
-            .border_color(theme.border)
+            .w_full()
             .flex()
-            .flex_col()
-            .gap_1()
-            .children(children)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(ui::lane_rail(&theme, on))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .children(children),
+            )
     }
 
     fn branch_header(
@@ -2731,14 +2813,12 @@ impl GbWindow {
         branch: &gb_bridge::BranchSummary,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let selected = self.store.cursor(Pane::Branches) == index;
-        let focused = self.store.pane == Pane::Branches && selected;
         let collapsed = self
             .store
             .collapsed
             .contains(&collapse_key(item.stack, &branch.name));
-        let mark = if collapsed { "▸" } else { "▾" };
         let action = if collapsed { "Expand" } else { "Collapse" };
         let name = branch.name.clone();
         let tip = branch.tip_sha.clone();
@@ -2747,21 +2827,21 @@ impl GbWindow {
         let row_tip = if tip.is_empty() {
             format!("Focus branch {name}")
         } else {
-            format!("Focus branch {name} · {tip}")
+            format!("Focus branch {name}. Tip {tip}.")
         };
         div()
             .id(SharedString::from(format!("branch-{index}")))
             .px_2()
             .min_h(px(28.))
-            .rounded_md()
             .flex()
             .items_center()
             .gap_2()
             .overflow_hidden()
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(focused, &theme))
             .when(selected, |row| row.bg(theme.selected))
+            .when(!selected, |row| {
+                row.hover(move |style| style.bg(theme.hover))
+            })
             .tooltip(Tooltip::text(row_tip))
             .on_mouse_down(MouseButton::Right, {
                 let name = name.clone();
@@ -2786,16 +2866,27 @@ impl GbWindow {
                 div()
                     .id(SharedString::from(format!("chevron-{index}")))
                     .w(px(18.))
+                    .h(px(18.))
                     .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .cursor_pointer()
-                    .text_color(theme.muted)
                     .tooltip(Tooltip::text(chevron_tip))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         cx.stop_propagation();
                         this.store.toggle_branch_collapsed(index);
                         cx.notify();
                     }))
-                    .child(mark),
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::Sm)
+                        .color(gpui::Hsla::from(theme.muted)),
+                    ),
             )
             .child(
                 div()
@@ -2845,7 +2936,7 @@ impl GbWindow {
     }
 
     fn lane_push_status(&self, lane: &str) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let busy = self.store.remote.push_busy.as_deref() == Some(lane);
         let result = self.store.remote.push_results.get(lane).cloned();
         let pushing = busy
@@ -2915,7 +3006,7 @@ impl GbWindow {
         review: &gb_bridge::Review,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let dot = match review.ci {
             gb_bridge::CiState::Passing => theme.ok,
             gb_bridge::CiState::Failing => theme.err,
@@ -2939,9 +3030,8 @@ impl GbWindow {
             .items_center()
             .gap_1()
             .rounded_sm()
-            .border_1()
-            .border_color(gpui::Hsla::from(theme.border))
             .cursor_pointer()
+            .hover(move |style| style.bg(theme.hover))
             .tooltip(Tooltip::text(tip))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 cx.stop_propagation();
@@ -2978,9 +3068,8 @@ impl GbWindow {
         commit: &CommitSummary,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let selected = self.store.cursor(Pane::Branches) == index;
-        let focused = self.store.pane == Pane::Branches && selected;
         let sha = commit.sha.clone();
         let short = commit.short_sha.clone();
         let title = commit.title.clone();
@@ -2992,16 +3081,16 @@ impl GbWindow {
             .id(SharedString::from(format!("commit-{index}")))
             .px_2()
             .py_1()
-            .rounded_md()
             .flex()
             .flex_col()
             .gap(px(2.))
             .overflow_hidden()
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(focused, &theme))
             .when(selected, |row| row.bg(theme.selected))
-            .tooltip(Tooltip::text(format!("Focus commit {sha}: {title}")))
+            .when(!selected, |row| {
+                row.hover(move |style| style.bg(theme.hover))
+            })
+            .tooltip(Tooltip::text(format!("Focus commit {sha}. {title}.")))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.store.set_cursor(Pane::Branches, index);
                 let effect = this.store.open_current();
@@ -3111,9 +3200,10 @@ impl GbWindow {
         &self,
         title: String,
         tip: String,
+        lane: Option<String>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         div()
             .flex_none()
             .h(px(32.))
@@ -3134,6 +3224,13 @@ impl GbWindow {
                     .tooltip(Tooltip::text(tip))
                     .child(title),
             )
+            .children(lane.map(|name| {
+                div()
+                    .id("detail-lane-chip")
+                    .flex_none()
+                    .tooltip(Tooltip::text(format!("This commit sits in {name}")))
+                    .child(ns_ui::chip(name, Tone::Neutral))
+            }))
             .child(
                 IconButton::new("detail-close", IconName::X)
                     .variant(ButtonVariant::Ghost)
@@ -3148,18 +3245,24 @@ impl GbWindow {
     }
 
     fn commit_detail(&self, sha: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme::current();
         let ready = self
             .store
             .commit
             .as_ref()
             .is_some_and(|commit| commit.sha == sha || commit.short_sha == sha);
         let title = format!("Commit {}", short7(sha));
-        let header = self.detail_header(title.clone(), title, cx);
+        let lane = self.store.branch_name_for(sha);
+        let header = self.detail_header(title.clone(), title, lane, cx);
         let body = if self.store.activity.spinner_on("commit_details") && !ready {
             div()
                 .flex_1()
                 .min_h(px(0.))
-                .child(ns_ui::loading_pane("commit-loading", "Reading the commit"))
+                .child(ui::loading_pane(
+                    "commit-loading",
+                    "Reading the commit",
+                    &theme,
+                ))
                 .into_any_element()
         } else if self.store.activity.is_loading("commit_details") && !ready {
             quiet_body()
@@ -3193,94 +3296,104 @@ impl GbWindow {
     }
 
     fn commit_facts(&self, details: &CommitDetails, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
         let additions: u32 = details.files.iter().map(|file| file.additions).sum();
         let deletions: u32 = details.files.iter().map(|file| file.deletions).sum();
-        let totals = format!("+{additions} -{deletions} in {} files", details.files.len());
-        let parents_short = if details.parents.is_empty() {
-            "none".to_string()
-        } else {
-            details
-                .parents
-                .iter()
-                .map(|sha| short7(sha))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
         let sha = details.sha.clone();
         let mut files: Vec<gpui::AnyElement> = Vec::new();
         for (index, file) in details.files.iter().enumerate() {
             files.push(self.commit_file_row(index, file, cx).into_any_element());
         }
+        let (title, body) = split_message(&details.message);
+        let file_word = if details.files.len() == 1 {
+            "file"
+        } else {
+            "files"
+        };
         ScrollArea::new("commit-scroll")
             .vertical()
             .flex_1()
             .min_h(px(0.))
             .child(
+                // Message, authorship and sha above the hairline.
                 div()
                     .w_full()
+                    .min_w(px(0.))
                     .px_3()
-                    .py_2()
+                    .pt_2()
+                    .pb_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("commit-message")
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .whitespace_normal()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .tooltip(Tooltip::text(details.message.clone()))
+                                    .child(title),
+                            )
+                            .when_some(body, |block, body| {
+                                block.child(
+                                    div()
+                                        .w_full()
+                                        .min_w(px(0.))
+                                        .whitespace_normal()
+                                        .text_xs()
+                                        .text_color(theme::current().muted)
+                                        .child(body),
+                                )
+                            }),
+                    )
+                    .child(commit_meta(details))
+                    .child(sha_row(&sha, cx)),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(theme::current().border),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(
                         div()
-                            .id("commit-message")
                             .w_full()
-                            .min_w(px(0.))
-                            .whitespace_normal()
-                            .text_sm()
-                            .tooltip(Tooltip::text(details.message.clone()))
-                            .child(compact_message(&details.message)),
-                    )
-                    .child(meta_line("meta-author", "Author", &details.author))
-                    .child(meta_line("meta-committer", "Committer", &details.committer))
-                    .child(meta_line(
-                        "meta-authored",
-                        "Authored",
-                        &dated(details.authored_at),
-                    ))
-                    .child(meta_line(
-                        "meta-committed",
-                        "Committed",
-                        &dated(details.committed_at),
-                    ))
-                    .child(meta_line("meta-parents", "Parents", &parents_short))
-                    .child(
-                        div()
+                            .px_3()
+                            .pt_2()
+                            .pb_1()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .overflow_hidden()
                             .child(
                                 div()
-                                    .id("commit-sha")
+                                    .id("commit-files-label")
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .font_family(ns_ui::CODE_FONT)
                                     .text_xs()
-                                    .text_color(theme.muted)
-                                    .truncate()
-                                    .tooltip(Tooltip::text(sha.clone()))
-                                    .child(sha.clone()),
+                                    .text_color(theme::current().muted)
+                                    .tooltip(Tooltip::text(format!(
+                                        "Changed files in this commit, {} {}",
+                                        details.files.len(),
+                                        file_word
+                                    )))
+                                    .child(format!("{} {}", details.files.len(), file_word)),
                             )
-                            .child(copy_button("copy-sha", sha, cx)),
-                    )
-                    .child(
-                        div()
-                            .id("commit-totals")
-                            .text_xs()
-                            .font_family(ns_ui::CODE_FONT)
-                            .tooltip(Tooltip::text(totals.clone()))
-                            .child(totals),
-                    )
-                    .child(
-                        div()
-                            .pt_1()
-                            .text_xs()
-                            .text_color(theme.muted)
-                            .child("Files"),
+                            .child(counts(additions, deletions)),
                     )
                     .children(files),
             )
@@ -3292,7 +3405,7 @@ impl GbWindow {
         file: &CommitFile,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let selected = self.store.cursor(Pane::Detail) == index
             && matches!(self.store.side, SideFocus::Commit { .. });
         let focused = self.store.pane == Pane::Detail && selected;
@@ -3300,16 +3413,22 @@ impl GbWindow {
         div()
             .id(SharedString::from(format!("detail-file-{index}")))
             .px_2()
-            .min_h(px(28.))
-            .rounded_md()
+            .min_h(px(30.))
             .flex()
             .items_center()
             .gap_2()
             .overflow_hidden()
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(focused, &theme))
+            .border_l_2()
+            .border_color(if focused {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.editor)
+            })
             .when(selected, |row| row.bg(theme.selected))
+            .when(!selected, |row| {
+                row.hover(move |style| style.bg(theme.hover))
+            })
             .tooltip(Tooltip::text(format!("Show the diff for {path}")))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.store.set_cursor(Pane::Detail, index);
@@ -3336,12 +3455,12 @@ impl GbWindow {
                 .size_full()
                 .flex()
                 .flex_col()
-                .child(self.detail_header("Branch".to_string(), "Branch".to_string(), cx))
+                .child(self.detail_header("Branch".to_string(), "Branch".to_string(), None, cx))
                 .child(wrapped_note("This branch is no longer in the workspace."))
                 .into_any_element();
         };
         let title = info.name.clone();
-        let header = self.detail_header(title.clone(), format!("Branch {title}"), cx);
+        let header = self.detail_header(title.clone(), format!("Branch {title}"), None, cx);
         let facts = self.branch_facts(&info, cx);
         div()
             .size_full()
@@ -3355,7 +3474,7 @@ impl GbWindow {
     }
 
     fn branch_facts(&self, info: &BranchFocusInfo, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let full = if info.tip_full.is_empty() {
             info.tip_sha.clone()
         } else {
@@ -3493,7 +3612,7 @@ impl GbWindow {
         commit: &store::CommitLine,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let selected = self.store.cursor(Pane::Detail) == index
             && matches!(self.store.side, SideFocus::Branch { .. });
         let focused = self.store.pane == Pane::Detail && selected;
@@ -3502,16 +3621,22 @@ impl GbWindow {
         div()
             .id(SharedString::from(format!("detail-commit-{index}")))
             .px_2()
-            .min_h(px(28.))
-            .rounded_md()
+            .min_h(px(30.))
             .flex()
             .items_center()
             .gap_2()
             .overflow_hidden()
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(focused, &theme))
+            .border_l_2()
+            .border_color(if focused {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.editor)
+            })
             .when(selected, |row| row.bg(theme.selected))
+            .when(!selected, |row| {
+                row.hover(move |style| style.bg(theme.hover))
+            })
             .tooltip(Tooltip::text(format!("Focus commit {short}: {title}")))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.store.set_cursor(Pane::Detail, index);
@@ -3553,7 +3678,7 @@ impl GbWindow {
     }
 
     fn project_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         if self.store.projects.is_empty() {
             rows.push(wrapped_note(self.menu_empty_text()).into_any_element());
@@ -3565,8 +3690,8 @@ impl GbWindow {
         div()
             .id("project-menu-panel")
             .absolute()
-            .top(px(42.))
-            .left(px(72.))
+            .top(px(46.))
+            .left(px(100.))
             .w(px(340.))
             .max_h(px(360.))
             .occlude()
@@ -3583,13 +3708,13 @@ impl GbWindow {
                 ScrollArea::new("project-menu-scroll")
                     .vertical()
                     .max_h(px(280.))
-                    .child(div().w_full().p_1().flex().flex_col().children(rows)),
+                    .child(div().w_full().flex().flex_col().children(rows)),
             )
             .child(self.project_add(cx))
     }
 
     fn project_add(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let marked = self.store.project_cursor() == self.store.projects.len();
         let open = self.store.remote.add_open;
         let focused = self.store.remote.add_focused;
@@ -3615,14 +3740,18 @@ impl GbWindow {
                     .id("add-project")
                     .w_full()
                     .px_2()
-                    .min_h(px(28.))
-                    .rounded_md()
+                    .min_h(px(32.))
                     .flex()
                     .items_center()
                     .cursor_pointer()
-                    .border_1()
-                    .border_color(ring(marked, &theme))
+                    .border_l_2()
+                    .border_color(if marked {
+                        gpui::Hsla::from(theme.accent)
+                    } else {
+                        gpui::Hsla::from(theme.panel)
+                    })
                     .when(marked, |row| row.bg(theme.selected))
+                    .when(!marked, |row| row.hover(move |style| style.bg(theme.hover)))
                     .text_sm()
                     .tooltip(Tooltip::text(
                         "Remember a repository that is already on this computer. Type its folder path.",
@@ -3642,9 +3771,8 @@ impl GbWindow {
                             .id("add-project-path")
                             .w_full()
                             .h(px(28.))
-                            .px_2()
-                            .rounded_md()
-                            .border_1()
+                            .px_1()
+                            .border_b_1()
                             .border_color(if focused {
                                 gpui::Hsla::from(theme.accent)
                             } else {
@@ -3724,16 +3852,16 @@ impl GbWindow {
         project: &gb_bridge::ProjectSummary,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let id = project.id.clone();
         let title = project.title.clone();
         let path = project.path.clone();
         let hint = self.store.project_hint(&id);
         let selected = self.store.selected.as_deref() == Some(id.as_str());
         let marked = self.store.project_cursor() == index;
-        let mut tip = format!("{title} · {path}");
+        let mut tip = format!("{title}. {path}");
         if let Some(hint) = &hint {
-            tip.push_str(" · ");
+            tip.push(' ');
             tip.push_str(hint);
         }
         div()
@@ -3741,13 +3869,16 @@ impl GbWindow {
             .w_full()
             .px_2()
             .py_1()
-            .rounded_md()
             .flex()
             .flex_col()
             .gap(px(2.))
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(marked, &theme))
+            .border_l_2()
+            .border_color(if marked {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.panel)
+            })
             .when(selected || marked, |row| row.bg(theme.selected))
             .when(!(selected || marked), |row| {
                 row.hover(move |style| style.bg(theme.hover))
@@ -3801,7 +3932,7 @@ impl GbWindow {
     }
 
     fn setup_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let branches = self.store.remote.branches.clone();
         let selected = self.store.remote.branch_index;
         let push_remote = self.store.remote.push_remote.clone();
@@ -3835,15 +3966,19 @@ impl GbWindow {
                     .w_full()
                     .min_h(px(32.))
                     .px_2()
-                    .rounded_md()
                     .flex()
                     .items_center()
                     .gap_2()
                     .overflow_hidden()
                     .cursor_pointer()
-                    .border_1()
-                    .border_color(ring(marked, &theme))
+                    .border_l_2()
+                    .border_color(if marked {
+                        gpui::Hsla::from(theme.accent)
+                    } else {
+                        gpui::Hsla::from(theme.panel)
+                    })
                     .when(marked, |row| row.bg(theme.selected))
+                    .when(!marked, |row| row.hover(move |style| style.bg(theme.hover)))
                     .tooltip(Tooltip::text(format!(
                         "Base your work on {label}. Ref {full}."
                     )))
@@ -3901,7 +4036,6 @@ impl GbWindow {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
                     .children(rows),
             )
             .child(div().text_xs().text_color(theme.muted).child("Push remote"))
@@ -3910,15 +4044,13 @@ impl GbWindow {
                     .id("setup-push-remote")
                     .w_full()
                     .h(px(28.))
-                    .px_2()
-                    .rounded_md()
-                    .border_1()
+                    .px_1()
+                    .border_b_1()
                     .border_color(if field_focused {
                         gpui::Hsla::from(theme.accent)
                     } else {
                         gpui::Hsla::from(theme.border)
                     })
-                    .bg(theme.editor)
                     .flex()
                     .items_center()
                     .overflow_hidden()
@@ -3990,7 +4122,7 @@ impl GbWindow {
     }
 
     fn integrate_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let commits = self.store.remote.upstream.clone();
         let lanes = self.store.lane_names();
         let cursor = self.store.remote.integrate_cursor;
@@ -4054,13 +4186,16 @@ impl GbWindow {
                     .id(SharedString::from(format!("integrate-lane-{index}")))
                     .min_h(px(32.))
                     .px_2()
-                    .rounded_md()
                     .flex()
                     .items_center()
                     .gap_2()
                     .overflow_hidden()
-                    .border_1()
-                    .border_color(ring(marked, &theme))
+                    .border_l_2()
+                    .border_color(if marked {
+                        gpui::Hsla::from(theme.accent)
+                    } else {
+                        gpui::Hsla::from(theme.panel)
+                    })
                     .when(marked, |row| row.bg(theme.selected))
                     .child(
                         div()
@@ -4107,7 +4242,7 @@ impl GbWindow {
         div()
             .id("integrate-panel")
             .absolute()
-            .top(px(84.))
+            .top(px(56.))
             .right(px(12.))
             .w(px(400.))
             .max_h(px(560.))
@@ -4191,11 +4326,14 @@ impl GbWindow {
                                     .id("integrate-apply-row")
                                     .min_h(px(32.))
                                     .px_1()
-                                    .rounded_md()
                                     .flex()
                                     .items_center()
-                                    .border_1()
-                                    .border_color(ring(apply_marked, &theme))
+                                    .border_l_2()
+                                    .border_color(if apply_marked {
+                                        gpui::Hsla::from(theme.accent)
+                                    } else {
+                                        gpui::Hsla::from(theme.panel)
+                                    })
                                     .when(apply_marked, |row| row.bg(theme.selected))
                                     .child(word_button(
                                         SharedString::from("integrate-apply"),
@@ -4232,7 +4370,7 @@ impl GbWindow {
         let Some(lane) = self.store.remote.push_menu.clone() else {
             return div().into_any_element();
         };
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let cursor = self.store.remote.push_cursor;
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         for (index, (label, force)) in store::PUSH_CHOICES.iter().enumerate() {
@@ -4245,13 +4383,19 @@ impl GbWindow {
                     .w_full()
                     .min_h(px(28.))
                     .px_2()
-                    .rounded_md()
                     .flex()
                     .items_center()
                     .cursor_pointer()
-                    .border_1()
-                    .border_color(ring(marked, &theme))
+                    .border_l_2()
+                    .border_color(if danger {
+                        gpui::Hsla::from(theme.err)
+                    } else if marked {
+                        gpui::Hsla::from(theme.accent)
+                    } else {
+                        gpui::Hsla::from(theme.panel)
+                    })
                     .when(marked, |row| row.bg(theme.selected))
+                    .when(!marked, |row| row.hover(move |style| style.bg(theme.hover)))
                     .text_sm()
                     .text_color(if danger { theme.err } else { theme.text })
                     .tooltip(Tooltip::text(tip))
@@ -4272,7 +4416,7 @@ impl GbWindow {
             .absolute()
             // Below the window header, the column header, and the target line,
             // so the menu does not cover "Target refs/remotes/…".
-            .top(px(168.))
+            .top(px(120.))
             .right(px(16.))
             .w(px(280.))
             .occlude()
@@ -4305,7 +4449,7 @@ impl GbWindow {
     }
 
     fn remote_confirm(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let (title, message, confirm, destructive) =
             if let Some(ask) = self.store.remote.push_confirm.clone() {
                 (ask.title, ask.message, "Force push", true)
@@ -4357,7 +4501,7 @@ impl GbWindow {
         let Some(request) = self.store.remote.askpass.clone() else {
             return div().into_any_element();
         };
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let label = store::askpass_label(&request);
         let reveal = self.store.remote.reveal;
         let shown = self.store.remote.shown_secret();
@@ -4379,7 +4523,7 @@ impl GbWindow {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::hsla(0., 0., 0., 0.72))
+            .bg(theme::scrim())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
@@ -4417,11 +4561,9 @@ impl GbWindow {
                                     .flex_1()
                                     .min_w(px(0.))
                                     .h(px(32.))
-                                    .px_2()
-                                    .rounded_md()
-                                    .border_1()
+                                    .px_1()
+                                    .border_b_1()
                                     .border_color(gpui::Hsla::from(theme.accent))
-                                    .bg(theme.editor)
                                     .flex()
                                     .items_center()
                                     .overflow_hidden()
@@ -4495,19 +4637,19 @@ impl GbWindow {
         if !self.store.composer.open {
             return self.composer_collapsed(cx);
         }
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let new_lane = self.store.composer.new_lane;
         div()
             .id("composer")
             .flex_none()
-            .h(px(188.))
             .w_full()
             .overflow_hidden()
             .flex()
             .flex_col()
-            .gap(px(4.))
-            .px_2()
-            .py_1()
+            .gap(px(2.))
+            .px_3()
+            .pt_2()
+            .pb_2()
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.panel)
@@ -4529,17 +4671,17 @@ impl GbWindow {
     }
 
     fn composer_collapsed(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let summary = self.store.commit_summary();
         div()
             .id("composer-collapsed")
             .flex_none()
-            .h(px(36.))
+            .h(px(40.))
             .w_full()
-            .px_2()
+            .px_3()
             .flex()
             .items_center()
-            .gap_2()
+            .gap_3()
             .overflow_hidden()
             .border_t_1()
             .border_color(theme.border)
@@ -4577,11 +4719,11 @@ impl GbWindow {
     }
 
     fn composer_lane_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let label = self.store.composer_lane_label();
         let tip = format!("Commit to {label}. Choose a lane, or New lane.");
         div()
-            .h(px(26.))
+            .h(px(28.))
             .flex()
             .items_center()
             .gap_1()
@@ -4590,12 +4732,10 @@ impl GbWindow {
                     .id("composer-lane")
                     .flex_1()
                     .min_w(px(0.))
-                    .h(px(24.))
-                    .px_2()
-                    .rounded_md()
-                    .border_1()
+                    .h(px(28.))
+                    .px_1()
+                    .border_b_1()
                     .border_color(theme.border)
-                    .bg(theme.editor)
                     .flex()
                     .items_center()
                     .overflow_hidden()
@@ -4629,7 +4769,7 @@ impl GbWindow {
         placeholder: &'static str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let value = match field {
             Field::Title => self.store.composer.title.clone(),
             Field::Body => self.store.composer.body.clone(),
@@ -4641,9 +4781,9 @@ impl GbWindow {
             Field::LaneName => false,
         };
         let height = match field {
-            Field::Body if self.store.composer.new_lane => px(24.),
-            Field::Body => px(48.),
-            Field::Title | Field::LaneName => px(24.),
+            Field::Body if self.store.composer.new_lane => px(32.),
+            Field::Body => px(64.),
+            Field::Title | Field::LaneName => px(28.),
         };
         let focused = self.store.composer.field == Some(field);
         let empty = value.is_empty();
@@ -4671,10 +4811,13 @@ impl GbWindow {
             .h(height)
             .w_full()
             .px_2()
-            .rounded_md()
-            .border_1()
-            .border_color(ring(focused, &theme))
-            .bg(theme.editor)
+            .py_1()
+            .border_b_1()
+            .border_color(if focused {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.border)
+            })
             .overflow_hidden()
             .font_family(ns_ui::CODE_FONT)
             .text_xs()
@@ -4691,7 +4834,7 @@ impl GbWindow {
     }
 
     fn composer_ruler(&self) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let hint = self.store.ruler_hint();
         let warn = self.store.title_over() || self.store.body_over();
         div()
@@ -4707,7 +4850,7 @@ impl GbWindow {
     }
 
     fn composer_status(&self) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let (summary, color) = if let Some(error) = &self.store.composer.suggest_error {
             (error.clone(), theme.err)
         } else if self.store.message_hold.is_some() {
@@ -4738,7 +4881,7 @@ impl GbWindow {
     }
 
     fn composer_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let block = self.store.commit_block();
         let busy = self
             .store
@@ -4760,9 +4903,9 @@ impl GbWindow {
         let commit = if block.is_some() {
             div()
                 .id("do-commit-disabled")
-                .h(px(24.))
-                .px_2()
-                .rounded_md()
+                .h(px(28.))
+                .px_3()
+                .rounded_sm()
                 .flex()
                 .items_center()
                 .bg(theme.raised)
@@ -4774,13 +4917,14 @@ impl GbWindow {
         } else {
             div()
                 .id("do-commit")
-                .h(px(24.))
-                .px_2()
-                .rounded_md()
+                .h(px(28.))
+                .px_3()
+                .rounded_sm()
                 .flex()
                 .items_center()
                 .cursor_pointer()
                 .bg(theme.accent)
+                .hover(move |style| style.bg(theme.accent_hover))
                 .text_xs()
                 .text_color(theme.accent_ink)
                 .tooltip(Tooltip::text(tip))
@@ -4793,10 +4937,10 @@ impl GbWindow {
                 .into_any_element()
         };
         div()
-            .h(px(26.))
+            .h(px(32.))
             .flex()
             .items_center()
-            .gap_2()
+            .gap_3()
             .child(commit)
             .child(if let Some(reason) = self.store.mutation_blocked() {
                 inert_word(
@@ -4882,10 +5026,6 @@ impl GbWindow {
         self.store.folder_paths_vec(folder)
     }
 
-    fn folder_fully_marked(&self, folder: &str) -> bool {
-        self.store.folder_fully_marked(folder)
-    }
-
     fn open_row_actions(
         &mut self,
         index: usize,
@@ -4917,7 +5057,7 @@ impl GbWindow {
     }
 
     fn reword_editor(&self, draft: &str) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let shown = if draft.is_empty() {
             "Commit message▌".to_string()
         } else {
@@ -4937,9 +5077,8 @@ impl GbWindow {
                     .id("reword-draft")
                     .flex_1()
                     .min_h(px(0.))
-                    .px_2()
-                    .rounded_md()
-                    .border_1()
+                    .px_1()
+                    .border_b_1()
                     .border_color(gpui::Hsla::from(theme.accent))
                     .overflow_hidden()
                     .font_family(ns_ui::CODE_FONT)
@@ -4960,7 +5099,7 @@ impl GbWindow {
     }
 
     fn detail_note(&self) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let text = self.store.mutation_error.clone().unwrap_or_default();
         div()
             .id("detail-error")
@@ -5018,7 +5157,7 @@ impl GbWindow {
     }
 
     fn action_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let title = self.store.menu_title();
         let entries = self.store.menu_entries();
         let cursor = self.store.menu_cursor();
@@ -5037,17 +5176,18 @@ impl GbWindow {
                     .w_full()
                     .min_h(px(28.))
                     .px_2()
-                    .rounded_md()
                     .flex()
                     .items_center()
                     .gap_2()
                     .overflow_hidden()
                     .cursor_pointer()
-                    .border_1()
+                    .border_l_2()
                     .border_color(if destructive {
                         gpui::Hsla::from(theme.err)
+                    } else if marked {
+                        gpui::Hsla::from(theme.accent)
                     } else {
-                        ring(marked, &theme)
+                        gpui::Hsla::from(theme.panel)
                     })
                     .when(marked, |row| row.bg(theme.selected))
                     .when(!marked, |row| row.hover(move |style| style.bg(theme.hover)))
@@ -5097,9 +5237,10 @@ impl GbWindow {
         let height = rows_h.min(360.0);
         let (anchor_x, anchor_y) = self.store.menu_anchor();
         let size = window.viewport_size();
+        // Drop the menu below the click point so the trigger button stays visible.
         let (left, top) = store::clamp_popup(
             anchor_x,
-            anchor_y,
+            anchor_y + 26.0,
             280.0,
             height,
             size.width.as_f32(),
@@ -5115,6 +5256,8 @@ impl GbWindow {
                     .h(px(28.))
                     .flex()
                     .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
                     .text_xs()
                     .text_color(theme.muted)
                     .truncate()
@@ -5127,18 +5270,16 @@ impl GbWindow {
                 ScrollArea::new("action-menu-scroll")
                     .vertical()
                     .max_h(px(280.))
-                    .child(div().w_full().p_1().flex().flex_col().children(rows)),
+                    .child(div().w_full().flex().flex_col().children(rows)),
             )
             .when(naming, |panel| {
                 panel.child(
                     div()
                         .id("lane-name-draft")
-                        .mx_2()
                         .mb_2()
-                        .h(px(28.))
+                        .h(px(32.))
                         .px_2()
-                        .rounded_md()
-                        .border_1()
+                        .border_b_1()
                         .border_color(gpui::Hsla::from(theme.accent))
                         .flex()
                         .items_center()
@@ -5160,7 +5301,7 @@ impl GbWindow {
         let Some(confirm) = self.store.confirm.clone() else {
             return div().into_any_element();
         };
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let ask = ns_ui::Ask {
             title: confirm.title.into(),
             message: confirm.message.into(),
@@ -5226,7 +5367,7 @@ impl GbWindow {
         let Some(text) = self.store.toast.clone() else {
             return div().into_any_element();
         };
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         div()
             .id("mutation-toast")
             .absolute()
@@ -5267,7 +5408,7 @@ impl GbWindow {
         toast: store::ToastView,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let op = toast.op.clone();
         let details = if toast.details.is_empty() {
             toast.message.clone()
@@ -5343,7 +5484,7 @@ impl GbWindow {
         op: &str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let retry = self.store.activity.can_retry(op);
         let op_id = op.to_string();
         let stored = self.store.activity.details(op);
@@ -5409,7 +5550,7 @@ impl GbWindow {
     }
 
     fn edit_strip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let short = self
             .store
             .pages
@@ -5527,7 +5668,7 @@ impl GbWindow {
         div()
             .id("page-catcher")
             .absolute()
-            .top(px(72.))
+            .top(px(44.))
             .left(px(0.))
             .right(px(0.))
             .bottom(px(0.))
@@ -5542,7 +5683,7 @@ impl GbWindow {
     }
 
     fn branches_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let tab = self.store.pages.tab;
         let virtual_branches = self.virtual_branches();
         // The pull-request tab shows reviews, so the branch rows stay cached.
@@ -5567,7 +5708,7 @@ impl GbWindow {
                 || (loading && rows.is_empty() && self.store.activity.spinner_on("list_branches"))
             {
                 list.push(
-                    ns_ui::loading_pane("branches-page-loading", "Loading branches")
+                    ui::loading_pane("branches-page-loading", "Loading branches", &theme)
                         .into_any_element(),
                 );
             } else if loading && rows.is_empty() {
@@ -5643,10 +5784,8 @@ impl GbWindow {
                     .mx_3()
                     .mt_2()
                     .px_2()
-                    .rounded_md()
-                    .border_1()
+                    .border_b_1()
                     .border_color(gpui::Hsla::from(theme.border))
-                    .bg(theme.editor)
                     .flex()
                     .items_center()
                     .overflow_hidden()
@@ -5681,7 +5820,7 @@ impl GbWindow {
     }
 
     fn branch_tab_button(&self, tab: BranchTab, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let on = self.store.pages.tab == tab;
         let tip = match tab {
             BranchTab::Local => "Branches on this computer, including ones in the workspace",
@@ -5696,24 +5835,25 @@ impl GbWindow {
         };
         div()
             .id(SharedString::from(format!("branch-tab-{}", tab.name())))
-            .h(px(24.))
+            .h(px(40.))
             .px_2()
             .flex_none()
-            .rounded_md()
             .flex()
             .items_center()
             .text_xs()
             .cursor_pointer()
-            .border_1()
+            .border_b_2()
             .border_color(if on {
                 gpui::Hsla::from(theme.accent)
             } else {
-                gpui::Hsla::from(theme.border)
+                gpui::Hsla::from(theme.panel)
             })
-            .when(on, |button| {
-                button.bg(theme.selected).text_color(theme.accent)
+            .when(on, |button| button.text_color(theme.accent))
+            .when(!on, |button| {
+                button
+                    .text_color(theme.muted)
+                    .hover(move |style| style.text_color(theme.text))
             })
-            .when(!on, |button| button.text_color(theme.text))
             .tooltip(Tooltip::text(tip))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.store.set_branch_tab(tab);
@@ -5726,7 +5866,7 @@ impl GbWindow {
     /// The pull-request tab body. Rows come from the cached filtered reviews
     /// and are virtualized, so a 1,000-review list paints a viewport.
     fn pr_review_rows(&self, filter: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         if !self.store.forge.connected {
             let message = if self.store.forge.detail.is_empty() {
                 gb_bridge::FORGE_DISCONNECTED.to_string()
@@ -5789,7 +5929,7 @@ impl GbWindow {
         marked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let number = review.number;
         let state = review.state.label();
         let checks = review.ci.label();
@@ -5871,7 +6011,7 @@ impl GbWindow {
         marked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let name = row.name.clone();
         let author = if row.author.is_empty() {
             "Unknown author".to_string()
@@ -5890,22 +6030,19 @@ impl GbWindow {
         };
         div()
             .id(SharedString::from(format!("branch-row-{index}")))
-            .mx_2()
-            .px_2()
-            .py_1()
-            .min_h(px(72.))
-            .rounded_md()
+            .w_full()
+            .min_h(px(56.))
             .flex()
             .flex_col()
-            .gap(px(2.))
             .overflow_hidden()
-            .border_1()
-            .border_color(ring(marked, &theme))
+            .border_b_1()
+            .border_color(theme.border)
             .when(marked, |row| row.bg(theme.selected))
+            .when(!marked, |row| row.hover(move |style| style.bg(theme.hover)))
             .cursor_pointer()
             .tooltip(Tooltip::text(format!(
-                "{} · {} · {}",
-                row.ref_name, commit, author
+                "{}. {} by {author}.",
+                row.ref_name, commit
             )))
             .on_mouse_down(MouseButton::Right, {
                 let name = name.clone();
@@ -5930,6 +6067,21 @@ impl GbWindow {
             })
             .child(
                 div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(if marked {
+                        theme.accent
+                    } else {
+                        theme.background
+                    }),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pt_2()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -5951,46 +6103,6 @@ impl GbWindow {
                                 .tooltip(Tooltip::text(format!("{name} is in the workspace")))
                                 .child(ns_ui::chip("Applied".to_string(), Tone::Ok)),
                         )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .overflow_hidden()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_family(ns_ui::CODE_FONT)
-                            .text_color(theme.accent)
-                            .child(tip_short),
-                    )
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(commit))
-                    .child(div().flex_none().max_w(px(280.)).truncate().child(author)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(if let Some(label) = self.store.activity.row_label(&name) {
-                        div()
-                            .id(SharedString::from(format!("branch-busy-{index}")))
-                            .h(px(20.))
-                            .px_1()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .text_xs()
-                            .text_color(theme.accent)
-                            .tooltip(Tooltip::text(label.clone()))
-                            .child(label)
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
                     })
                     .child(more_button(
                         SharedString::from(format!("branch-more-{index}")),
@@ -6010,6 +6122,37 @@ impl GbWindow {
                             }
                         }),
                     )),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(ns_ui::CODE_FONT)
+                            .text_color(theme.accent)
+                            .child(tip_short),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(commit))
+                    .child(div().flex_none().max_w(px(240.)).truncate().child(author))
+                    .when_some(self.store.activity.row_label(&name), |line, label| {
+                        line.child(
+                            div()
+                                .id(SharedString::from(format!("branch-busy-{index}")))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(theme.accent)
+                                .tooltip(Tooltip::text(label.clone()))
+                                .child(label),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -6105,25 +6248,31 @@ impl GbWindow {
         marked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let title = snapshot.title.clone();
         let when = snapshot_when(snapshot.created_at_ms);
         let kind = snapshot_kind(&snapshot.operation);
         let sha = snapshot.sha.clone();
         div()
             .id(SharedString::from(format!("snapshot-{index}")))
-            .min_h(px(36.))
+            .min_h(px(40.))
             .px_2()
-            .rounded_md()
+            .py_1()
             .flex()
             .flex_col()
             .justify_center()
+            .gap(px(1.))
             .overflow_hidden()
             .cursor_pointer()
-            .border_1()
-            .border_color(ring(marked, &theme))
+            .border_l_2()
+            .border_color(if marked {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.editor)
+            })
             .when(marked, |row| row.bg(theme.selected))
-            .tooltip(Tooltip::text(format!("{title} · {when} · {kind}")))
+            .when(!marked, |row| row.hover(move |style| style.bg(theme.hover)))
+            .tooltip(Tooltip::text(format!("{title}. {when}. {kind}.")))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 let effect = this.store.select_snapshot_id(&sha);
                 this.finish_page_request(effect, cx);
@@ -6155,7 +6304,7 @@ impl GbWindow {
     }
 
     fn history_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let virtual_history = self.virtual_history();
         // Borrowed, not cloned: neither list is mutated while building rows.
         let snapshots = &self.store.pages.snapshots;
@@ -6176,7 +6325,9 @@ impl GbWindow {
                 && snapshots.is_empty()
                 && self.store.activity.spinner_on("list_snapshots"))
         {
-            rows.push(ns_ui::loading_pane("history-loading", "Loading history").into_any_element());
+            rows.push(
+                ui::loading_pane("history-loading", "Loading history", &theme).into_any_element(),
+            );
         } else if self.store.pages.history_loading && snapshots.is_empty() {
             rows.push(quiet_body());
         } else if virtual_history {
@@ -6332,11 +6483,13 @@ impl GbWindow {
                             .flex_1()
                             .min_w(px(0.))
                             .h(px(28.))
-                            .px_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(ring(focused, &theme))
-                            .bg(theme.editor)
+                            .px_1()
+                            .border_b_1()
+                            .border_color(if focused {
+                                gpui::Hsla::from(theme.accent)
+                            } else {
+                                gpui::Hsla::from(theme.border)
+                            })
                             .flex()
                             .items_center()
                             .overflow_hidden()
@@ -6372,7 +6525,7 @@ impl GbWindow {
                     .track_scroll(&self.history_scroll)
                     .flex_1()
                     .min_h(px(0.))
-                    .child(div().w_full().p_1().flex().flex_col().gap(px(2.)).children(rows))
+                    .child(div().w_full().flex().flex_col().children(rows))
                     .into_any_element()
             })
             .child(
@@ -6459,7 +6612,7 @@ impl GbWindow {
     }
 
     fn conflict_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let title = self.store.pages.conflict_title.clone();
         let short = self
             .store
@@ -6509,7 +6662,7 @@ impl GbWindow {
         div()
             .id("conflict-panel")
             .absolute()
-            .top(px(84.))
+            .top(px(56.))
             .left(px(8.))
             .w(px(400.))
             .max_h(px(520.))
@@ -6542,7 +6695,7 @@ impl GbWindow {
                             .tooltip(Tooltip::text(format!(
                                 "Resolve conflicts in {short} {title}"
                             )))
-                            .child(format!("Resolve conflicts · {short}")),
+                            .child(format!("Resolve conflicts in {short}")),
                     )
                     .child(
                         IconButton::new("conflict-close", IconName::X)
@@ -6576,15 +6729,7 @@ impl GbWindow {
                     .vertical()
                     .flex_1()
                     .min_h(px(80.))
-                    .child(
-                        div()
-                            .w_full()
-                            .p_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .children(rows),
-                    ),
+                    .child(div().w_full().flex().flex_col().children(rows)),
             )
             .child(
                 div()
@@ -6622,7 +6767,7 @@ impl GbWindow {
         marked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let path = file.path.clone();
         let ours = file.side == Some(gb_bridge::ConflictChoice::Ours);
         let theirs = file.side == Some(gb_bridge::ConflictChoice::Theirs);
@@ -6632,13 +6777,16 @@ impl GbWindow {
             .id(SharedString::from(format!("conflict-file-{index}")))
             .min_h(px(32.))
             .px_2()
-            .rounded_md()
             .flex()
             .items_center()
             .gap_2()
             .overflow_hidden()
-            .border_1()
-            .border_color(ring(marked, &theme))
+            .border_l_2()
+            .border_color(if marked {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.panel)
+            })
             .when(marked, |row| row.bg(theme.selected))
             .child(
                 div()
@@ -6665,7 +6813,7 @@ impl GbWindow {
         path: String,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let tip = if side == "ours" {
             format!("Keep the new base for {path}")
         } else {
@@ -6715,7 +6863,7 @@ impl GbWindow {
         let Some(ask) = self.store.pages.ask.clone() else {
             return div().into_any_element();
         };
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let confirm_icon = if ask.confirm_label.to_ascii_lowercase().contains("delete") {
             "trash"
         } else {
@@ -6770,8 +6918,18 @@ impl GbWindow {
         cx.notify();
     }
 
+    fn settings_scrim(&self) -> impl IntoElement {
+        div()
+            .id("settings-scrim")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme::scrim())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    }
+
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let section = self.store.settings.section;
         let cursor = self.store.settings.cursor;
         let global = self.store.settings.global.clone();
@@ -6785,7 +6943,7 @@ impl GbWindow {
         let confirm = self.store.settings.confirm_remove;
         let body = if self.store.settings.loading && global.is_none() {
             if self.store.activity.spinner_on("read_global") {
-                ns_ui::loading_pane("settings-loading", "Reading settings").into_any_element()
+                ui::loading_pane("settings-loading", "Reading settings", &theme).into_any_element()
             } else {
                 quiet_body()
             }
@@ -6808,14 +6966,18 @@ impl GbWindow {
         div()
             .id("settings-page")
             .absolute()
-            .top(px(72.))
-            .left(px(0.))
-            .right(px(0.))
-            .bottom(px(24.))
+            .top(px(64.))
+            .left(px(72.))
+            .right(px(72.))
+            .bottom(px(48.))
             .occlude()
             .flex()
             .flex_col()
             .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .shadow(cx.theme().elevation(Elevation::Floating))
             .bg(theme.background)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
@@ -6868,47 +7030,68 @@ impl GbWindow {
             SettingsSection::App => "settings-tab-app",
             SettingsSection::Project => "settings-tab-project",
         };
-        if on {
-            inert_word(SharedString::from(id), label, tip.to_string())
-        } else {
-            word_button(
-                SharedString::from(id),
-                label,
-                tip.to_string(),
-                false,
-                cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.store.show_settings_section(section);
-                    cx.notify();
-                }),
-            )
-        }
+        let theme = theme::current();
+        div()
+            .id(id)
+            .h(px(40.))
+            .px_2()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .border_b_2()
+            .border_color(if on {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.panel)
+            })
+            .text_sm()
+            .text_color(if on { theme.text } else { theme.muted })
+            .when(!on, move |tab| {
+                tab.hover(move |style| style.text_color(theme.text))
+            })
+            .tooltip(Tooltip::text(tip))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.store.show_settings_section(section);
+                cx.notify();
+            }))
+            .child(label)
+            .into_any_element()
     }
 
     fn remove_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         div()
             .id("settings-remove-confirm")
             .absolute()
-            .bottom(px(36.))
-            .left(px(12.))
-            .w(px(440.))
-            .p_3()
-            .rounded_md()
-            .bg(theme.panel)
-            .border_1()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .px_3()
+            .py_2()
+            .border_t_1()
             .border_color(theme.err)
+            .bg(theme.err_bg)
             .occlude()
             .flex()
-            .flex_col()
-            .gap_2()
+            .items_center()
+            .gap_3()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().text_sm().child("Remove this project from the app?"))
-            .child(div().text_xs().text_color(theme.muted).child(
-                "The repository folder stays on disk. This only drops it from the project list.",
-            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().text_sm().child("Remove this project from the app?"))
+                    .child(div().text_xs().text_color(theme.muted).child(
+                        "The repository folder stays on disk. This only drops it from the project list.",
+                    )),
+            )
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .gap_2()
                     .child(word_button(
                         SharedString::from("settings-remove-yes"),
@@ -6939,7 +7122,7 @@ impl GbWindow {
     }
 
     fn help_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ns_ui::theme();
+        let theme = theme::current();
         let rows: Vec<_> = shortcut_rows()
             .iter()
             .enumerate()
@@ -6948,7 +7131,7 @@ impl GbWindow {
         div()
             .id("help-card")
             .absolute()
-            .top(px(72.))
+            .top(px(44.))
             .bottom(px(36.))
             .right(px(12.))
             .w(px(460.))
@@ -7471,7 +7654,7 @@ fn paint_diff_row(
     chrome: Option<HunkChrome>,
     text: SharedString,
 ) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     let (fg, bg) = match row.kind {
         RowKind::Add => (theme.ok, Some(theme.ok_bg)),
         RowKind::Delete => (theme.err, Some(theme.err_bg)),
@@ -7497,8 +7680,12 @@ fn paint_diff_row(
         .font_family(ns_ui::CODE_FONT)
         .text_xs()
         .text_color(fg)
-        .border_1()
-        .border_color(ring(selected, &theme))
+        .border_l_2()
+        .border_color(if selected {
+            gpui::Hsla::from(theme.accent)
+        } else {
+            gpui::Hsla::from(theme.editor)
+        })
         .when(selected, |line| line.bg(theme.selected))
         .when(!selected, |line| line.when_some(bg, |line, bg| line.bg(bg)))
         .tooltip(Tooltip::text(lane_tip))
@@ -7533,7 +7720,7 @@ fn paint_diff_row(
                         .bg(theme.selected)
                         .text_color(theme.accent)
                         .tooltip(Tooltip::text(format!("Hunk assigned to {lane}")))
-                        .child(format!("→ {lane}")),
+                        .child(format!("in {lane}")),
                 )
             })
         })
@@ -7603,7 +7790,7 @@ fn inclusion_box(
     tip: String,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     div()
         .id(id)
         .w(px(16.))
@@ -7675,12 +7862,12 @@ fn word_button(
     danger: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     div()
         .id(id)
-        .h(px(20.))
-        .min_w(px(36.))
-        .px_1()
+        .h(px(28.))
+        .min_w(px(44.))
+        .px_2()
         .flex_none()
         .rounded_sm()
         .border_1()
@@ -7695,6 +7882,7 @@ fn word_button(
         .text_xs()
         .cursor_pointer()
         .text_color(if danger { theme.err } else { theme.text })
+        .hover(move |style| style.bg(theme.hover))
         .tooltip(Tooltip::text(tip))
         .on_click(on_click)
         .child(label)
@@ -7702,12 +7890,12 @@ fn word_button(
 }
 
 fn inert_word(id: SharedString, label: &'static str, tip: String) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     div()
         .id(id)
-        .h(px(20.))
-        .min_w(px(36.))
-        .px_1()
+        .h(px(28.))
+        .min_w(px(44.))
+        .px_2()
         .flex_none()
         .rounded_sm()
         .border_1()
@@ -7723,7 +7911,7 @@ fn inert_word(id: SharedString, label: &'static str, tip: String) -> gpui::AnyEl
 }
 
 fn notice_line(id: &'static str, text: &str, bad: bool) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     let color = if text.is_empty() {
         theme.muted
     } else if bad {
@@ -7758,7 +7946,7 @@ fn wait_slot(id: SharedString, tip: String) -> gpui::AnyElement {
         .items_center()
         .justify_center()
         .text_xs()
-        .text_color(ns_ui::theme().accent)
+        .text_color(theme::current().accent)
         .tooltip(Tooltip::text(tip))
         .child("…")
         .into_any_element()
@@ -7769,7 +7957,7 @@ fn same_commit(left: &str, right: &str) -> bool {
 }
 
 fn gutter(line: Option<u32>) -> gpui::Div {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     div()
         .w(px(36.))
         .flex_none()
@@ -7779,7 +7967,7 @@ fn gutter(line: Option<u32>) -> gpui::Div {
 }
 
 fn status_mark(status: FileStatus) -> gpui::Div {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     let color = match status {
         FileStatus::Added => theme.ok,
         FileStatus::Modified => theme.accent,
@@ -7796,7 +7984,7 @@ fn status_mark(status: FileStatus) -> gpui::Div {
 }
 
 fn counts(additions: u32, deletions: u32) -> gpui::Div {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     div()
         .flex_none()
         .flex()
@@ -7816,7 +8004,7 @@ fn marker_chip(index: usize, label: &str, tip: &str, tone: Tone) -> impl IntoEle
 }
 
 fn target_line(target: &str) -> impl IntoElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     let tip = if target == "No target branch" {
         "No remote is set. Choose a target branch before you fetch or push.".to_string()
     } else {
@@ -7829,7 +8017,10 @@ fn target_line(target: &str) -> impl IntoElement {
         .flex()
         .items_center()
         .gap_2()
-        .px_1()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.border)
         .tooltip(Tooltip::text(tip))
         .child(
             div()
@@ -7859,7 +8050,7 @@ fn meta_line_wrap(id: &str, label: &str, value: &str) -> impl IntoElement {
 }
 
 fn meta_line_inner(id: &str, label: &str, value: &str, wrap: bool) -> impl IntoElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     div()
         .id(SharedString::from(id.to_string()))
         .w_full()
@@ -7890,13 +8081,179 @@ fn meta_line_inner(id: &str, label: &str, value: &str, wrap: bool) -> impl IntoE
 
 /// Drop blank lines so a subject and body stay two lines, not three.
 /// The tooltip still carries the original message.
-fn compact_message(message: &str) -> String {
-    message
+/// First line of a commit message, and the rest when there is one.
+fn split_message(message: &str) -> (String, Option<String>) {
+    let mut lines = message
         .lines()
         .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+        .filter(|line| !line.trim().is_empty());
+    let Some(title) = lines.next() else {
+        return ("(no message)".to_string(), None);
+    };
+    let rest: Vec<&str> = lines.collect();
+    let body = (!rest.is_empty()).then(|| rest.join("\n"));
+    (title.to_string(), body)
+}
+
+/// `"Ada Lovelace <ada@example.com>"` split into the display name and email.
+fn author_parts(author: &str) -> (&str, Option<&str>) {
+    match author.find(" <") {
+        Some(index) if author.ends_with('>') => {
+            (&author[..index], Some(&author[index + 2..author.len() - 1]))
+        }
+        _ => (author, None),
+    }
+}
+
+/// Authorship block for the commit detail: who wrote it and when, the
+/// committer only when it differs, and the parents when there are any.
+/// Every row truncates and carries the full text in its tooltip.
+fn commit_meta(details: &CommitDetails) -> gpui::Div {
+    let theme = theme::current();
+    let (name, email) = author_parts(&details.author);
+    let authored_tip = match email {
+        Some(email) => format!("Authored {} by {name}, {email}", dated(details.authored_at)),
+        None => format!("Authored {} by {name}", dated(details.authored_at)),
+    };
+    let (committer_name, committer_email) = author_parts(&details.committer);
+    let committed_differs =
+        details.committer != details.author || details.committed_at != details.authored_at;
+    let committed_tip = match committer_email {
+        Some(email) => format!(
+            "Committed {} by {committer_name}, {email}",
+            dated(details.committed_at)
+        ),
+        None => format!(
+            "Committed {} by {committer_name}",
+            dated(details.committed_at)
+        ),
+    };
+    div()
+        .w_full()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .id("commit-author")
+                .w_full()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap_2()
+                .overflow_hidden()
+                .text_xs()
+                .tooltip(Tooltip::text(authored_tip))
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(theme.text)
+                        .child(name.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.muted)
+                        .child(relative(details.authored_at)),
+                ),
+        )
+        .when(committed_differs, |block| {
+            block.child(
+                div()
+                    .id("commit-committer")
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    .text_xs()
+                    .tooltip(Tooltip::text(committed_tip))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(theme.muted)
+                            .child(format!("Committed by {committer_name}")),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.muted)
+                            .child(relative(details.committed_at)),
+                    ),
+            )
+        })
+        .when(!details.parents.is_empty(), |block| {
+            let label = if details.parents.len() == 1 {
+                "Parent"
+            } else {
+                "Parents"
+            };
+            block.child(
+                div()
+                    .id("commit-parents")
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    .text_xs()
+                    .tooltip(Tooltip::text(details.parents.join("\n")))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.muted)
+                            .child(label.to_string()),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .font_family(ns_ui::CODE_FONT)
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(
+                                details
+                                    .parents
+                                    .iter()
+                                    .map(|sha| short7(sha))
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                            ),
+                    ),
+            )
+        })
+}
+
+/// The commit sha as a 12-character prefix with the full sha in the tooltip
+/// and the copy button beside it.
+fn sha_row(sha: &str, cx: &mut Context<GbWindow>) -> impl IntoElement {
+    let theme = theme::current();
+    let prefix: String = sha.chars().take(12).collect();
+    div()
+        .id("commit-sha-row")
+        .w_full()
+        .min_w(px(0.))
+        .flex()
+        .items_center()
+        .gap_1()
+        .overflow_hidden()
+        .child(
+            div()
+                .id("commit-sha")
+                .flex_1()
+                .min_w(px(0.))
+                .font_family(ns_ui::CODE_FONT)
+                .text_xs()
+                .text_color(theme.muted)
+                .truncate()
+                .tooltip(Tooltip::text(sha.to_string()))
+                .child(prefix),
+        )
+        .child(copy_button("copy-sha", sha.to_string(), cx))
 }
 
 fn copy_button(id: &'static str, text: String, cx: &mut Context<GbWindow>) -> gpui::AnyElement {
@@ -8017,10 +8374,9 @@ fn app_settings_rows(
     }
     div()
         .w_full()
-        .p_3()
+        .py_2()
         .flex()
         .flex_col()
-        .gap_1()
         .children(rows)
         .into_any_element()
 }
@@ -8031,7 +8387,7 @@ fn project_settings_rows(
     cursor: usize,
     cx: &mut Context<GbWindow>,
 ) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     let mut rows: Vec<gpui::AnyElement> = Vec::new();
     if project.is_none() && error.is_none() {
         rows.push(settings_note(
@@ -8044,7 +8400,7 @@ fn project_settings_rows(
             div()
                 .id("settings-project-error")
                 .h(px(36.))
-                .px_2()
+                .px_3()
                 .flex()
                 .items_center()
                 .text_xs()
@@ -8109,10 +8465,9 @@ fn project_settings_rows(
     }
     div()
         .w_full()
-        .p_3()
+        .py_2()
         .flex()
         .flex_col()
-        .gap_1()
         .children(rows)
         .into_any_element()
 }
@@ -8125,22 +8480,29 @@ fn settings_choice(
     selected: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     let value = value.to_string();
     div()
         .id(SharedString::from(id))
-        .h(px(36.))
+        .h(px(40.))
         .w_full()
-        .px_2()
+        .px_3()
         .flex()
         .items_center()
         .gap_2()
-        .rounded_md()
         .overflow_hidden()
         .cursor_pointer()
-        .border_1()
-        .border_color(ring(selected, &theme))
+        .border_l_2()
+        .border_b_1()
+        .border_color(if selected {
+            gpui::Hsla::from(theme.accent)
+        } else {
+            gpui::Hsla::from(theme.border)
+        })
         .when(selected, |row| row.bg(theme.selected))
+        .when(!selected, |row| {
+            row.hover(move |style| style.bg(theme.hover))
+        })
         .tooltip(Tooltip::text(tip.to_string()))
         .on_click(on_click)
         .child(
@@ -8166,11 +8528,11 @@ fn settings_choice(
 }
 
 fn settings_note(id: impl Into<SharedString>, text: &str) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     div()
         .id(id.into())
-        .min_h(px(28.))
-        .px_2()
+        .min_h(px(32.))
+        .px_3()
         .flex()
         .items_center()
         .text_xs()
@@ -8181,7 +8543,7 @@ fn settings_note(id: impl Into<SharedString>, text: &str) -> gpui::AnyElement {
 }
 
 fn help_line(index: usize, keys: &str, what: &str, tokens: &[&str]) -> gpui::AnyElement {
-    let theme = ns_ui::theme();
+    let theme = theme::current();
     let tip = if tokens.is_empty() {
         what.to_string()
     } else {
@@ -8209,14 +8571,6 @@ fn help_line(index: usize, keys: &str, what: &str, tokens: &[&str]) -> gpui::Any
                 .child(what.to_string()),
         )
         .into_any_element()
-}
-
-fn ring(on: bool, theme: &ns_ui::Theme) -> gpui::Hsla {
-    if on {
-        gpui::Hsla::from(theme.accent)
-    } else {
-        gpui::transparent_black()
-    }
 }
 
 fn key_token(keystroke: &gpui::Keystroke) -> Option<String> {
@@ -8283,7 +8637,10 @@ fn project_button_tip(store: &Store) -> String {
         return "Choose a project (⌘P)".to_string();
     };
     match store.projects.iter().find(|project| &project.id == id) {
-        Some(project) => format!("{} · {} · ⌘P", project.title, project.path),
+        Some(project) => format!(
+            "Open {} at {}. ⌘P switches projects.",
+            project.title, project.path
+        ),
         None => "Choose a project (⌘P)".to_string(),
     }
 }
@@ -8303,7 +8660,7 @@ fn status_line(store: &Store, preview: bool) -> String {
         .map(clock)
         .unwrap_or_else(|| "--:--:--".to_string());
     if preview {
-        return format!("Preview (fake data) · changes stay in memory · updated {when}");
+        return format!("Preview data, held in memory. Updated {when}");
     }
     let title = store
         .selected
@@ -8316,7 +8673,7 @@ fn status_line(store: &Store, preview: bool) -> String {
                 .map(|project| project.title.as_str())
         })
         .unwrap_or("project");
-    format!("Live · writing through GitButler · watching {title} · updated {when}")
+    format!("Live, writing through GitButler, watching {title}. Updated {when}")
 }
 
 fn clock(time: SystemTime) -> String {
