@@ -66,12 +66,17 @@ pub fn shortcut_rows() -> &'static [Shortcut] {
         Shortcut {
             tokens: &["m"],
             keys: "m",
-            what: "Move the file, hunk, or commit",
+            what: "Move the focused file, hunk, or commit",
         },
         Shortcut {
             tokens: &["space"],
             keys: "Space",
             what: "Select a file or hunk",
+        },
+        Shortcut {
+            tokens: &["shift-up", "shift-down", "shift-j", "shift-k", "cmd-a"],
+            keys: "Shift ↑↓ or ⌘A",
+            what: "Extend the file selection, or select every visible file",
         },
         Shortcut {
             tokens: &["d", "backspace"],
@@ -135,6 +140,11 @@ pub fn shortcut_rows() -> &'static [Shortcut] {
         },
         Shortcut {
             tokens: &[],
+            keys: "Drag onto a lane",
+            what: "Assign a file or hunk, or move a commit or branch. The top half of a row places it above. The bottom half places it below. Drop on Uncommitted changes to clear a lane",
+        },
+        Shortcut {
+            tokens: &[],
             keys: "Drag column edge",
             what: "Resize the columns. Double-click the edge to reset",
         },
@@ -163,6 +173,10 @@ mod tests {
     fn prepare(store: &mut Store, token: &str) {
         match token {
             "up" => store.set_cursor(Pane::Uncommitted, 1),
+            "shift-up" | "shift-down" | "shift-j" | "shift-k" | "cmd-a" => {
+                store.pane = Pane::Uncommitted;
+                store.set_cursor(Pane::Uncommitted, 0);
+            }
             "escape" => store.help = true,
             "e" | "r" | "u" | "i" | "a" | "x" | "s" => {
                 store.focus_commit("a11a11a");

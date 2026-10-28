@@ -441,7 +441,7 @@ fn fetch_error(error: anyhow::Error) -> BridgeError {
         return BridgeError::not_ready(
             "Git asked for a password, and the askpass helper is not installed.",
         )
-        .with_hint("Set GITBUTLER_ASKPASS_BIN to the askpass helper, then try again.");
+        .with_hint("gb-gpui looks for gitbutler-git-askpass beside the app. Quit and reopen gb-gpui, then try again.");
     }
     mutate::api_error("fetch from remotes", error)
 }
@@ -452,7 +452,7 @@ fn push_error(error: anyhow::Error) -> BridgeError {
         return BridgeError::not_ready(
             "Git asked for a password, and the askpass helper is not installed.",
         )
-        .with_hint("Set GITBUTLER_ASKPASS_BIN to the askpass helper, then try again.");
+        .with_hint("gb-gpui looks for gitbutler-git-askpass beside the app. Quit and reopen gb-gpui, then try again.");
     }
     if is_force_protection(&blob) {
         return BridgeError::not_ready(

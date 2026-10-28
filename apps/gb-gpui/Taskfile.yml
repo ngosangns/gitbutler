@@ -1,0 +1,7 @@
+version: '3'
+
+tasks:
+  dev:install:
+    desc: Build gb-gpui with devtools and install "gb-gpui Dev.app" into ~/Applications
+    cmds:
+      - ./scripts/install-dev.sh

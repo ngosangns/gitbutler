@@ -23,12 +23,12 @@ use crate::read::{self, VersionSource};
 use crate::remote;
 use crate::settings::{self, GlobalPatch, GlobalSettings, ProjectSettings, Settings};
 use crate::{
-    Anchor, ApplyResult, AskpassRequest, AskpassWatch, Backend, BaseBranchData, BranchDetails,
-    BranchRow, BridgeError, BridgeEvent, CommitDetails, CommitResult, ConflictedCommit,
-    DiffRequest, DiscardResult, EditStatus, Environment, FetchReport, FetchStatus, FileChoice,
-    ForcePush, ForgeStatus, HookReport, IntegratePreview, IntegrateReport, LaneCreated,
-    ProjectList, ProjectSummary, PushReport, RemoteBranch, ResolveReport, Result, Review,
-    SelectionSpec, SnapshotChange, SnapshotInfo, SuggestedMessage, TextDiff, UndoResult,
+    Anchor, ApplyResult, AskpassRequest, AskpassWatch, Backend, BaseBranchData, BranchAnchor,
+    BranchDetails, BranchRow, BridgeError, BridgeEvent, CommitDetails, CommitResult,
+    ConflictedCommit, DiffRequest, DiscardResult, EditStatus, Environment, FetchReport,
+    FetchStatus, FileChoice, ForcePush, ForgeStatus, HookReport, IntegratePreview, IntegrateReport,
+    LaneCreated, ProjectList, ProjectSummary, PushReport, RemoteBranch, ResolveReport, Result,
+    Review, SelectionSpec, SnapshotChange, SnapshotInfo, SuggestedMessage, TextDiff, UndoResult,
     UpstreamStrategy, WatchHandle, WorkspaceSummary, WorktreeView,
 };
 
@@ -237,6 +237,10 @@ impl Backend for InProcessBackend {
 
     fn commit_details(&self, id: &str, sha: &str) -> Result<CommitDetails> {
         live::commit_details(self.source, id, sha)
+    }
+
+    fn branch_files(&self, id: &str, name: &str) -> Result<Vec<crate::CommitFile>> {
+        live::branch_files(self.source, id, name)
     }
 
     fn file_diff(&self, id: &str, request: DiffRequest) -> Result<TextDiff> {
@@ -468,6 +472,17 @@ impl Backend for InProcessBackend {
         let project = id.to_string();
         self.mutate(id, true, move || {
             mutate::move_commit(source, &project, &hub, &shas, &anchor)
+        })
+    }
+
+    fn move_branch(&self, id: &str, name: &str, anchor: &BranchAnchor) -> Result<CommitResult> {
+        let name = name.to_string();
+        let anchor = anchor.clone();
+        let source = self.source;
+        let hub = Arc::clone(&self.hub);
+        let project = id.to_string();
+        self.mutate(id, true, move || {
+            mutate::move_branch(source, &project, &hub, &name, &anchor)
         })
     }
 

@@ -7,8 +7,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use gb_bridge::{
-    Anchor, Backend, BranchPlace, FORGE_SIGN_IN, FileChange, ForcePush, HookReport, HookStatus,
-    HunkRef, SelectionSpec, WorkspaceSummary, WorktreeView,
+    Anchor, Backend, BranchAnchor, BranchPlace, FORGE_SIGN_IN, FileChange, ForcePush, HookReport,
+    HookStatus, HunkRef, SelectionSpec, WorkspaceSummary, WorktreeView,
 };
 
 use super::{Effect, Pane, RowKind, ShownFile, SideFocus, SpecsKey, Store};
@@ -52,6 +52,10 @@ pub enum Action {
     MoveCommit {
         sha: String,
         anchor: Anchor,
+    },
+    MoveBranch {
+        name: String,
+        anchor: BranchAnchor,
     },
     InsertBlank {
         anchor: Anchor,
@@ -142,7 +146,7 @@ pub enum MenuKind {
     },
     ComposerLane,
     AmendInto,
-    /// Move and discard for one file, a marked set, or a group.
+    /// Discard for one file, a marked set, or a group. Assigning is a drag.
     FileActions {
         paths: Vec<String>,
     },
@@ -188,16 +192,13 @@ pub enum EntryKind {
     Reword,
     Squash,
     Uncommit,
-    OpenMove,
     InsertBlank,
     Amend,
     EditCommit,
     PickLane(String),
     PickNewLane,
     AmendCommit(String),
-    OpenMoveFiles,
     DiscardFiles,
-    OpenMoveHunk,
     DiscardHunk,
     OpenPush(String),
     ForceLease(String),
@@ -209,6 +210,29 @@ pub enum EntryKind {
     UnapplyBranch(String),
     DeleteBranch(String),
     ResolveConflicts(String),
+}
+
+/// What a drag carries. One type so a lane, a commit, and the uncommitted
+/// header can share a single drop handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropItem {
+    Files(Vec<String>),
+    Hunk { path: String, header: String },
+    Commit(String),
+    Branch(String),
+}
+
+impl DropItem {
+    /// Short text for the card that follows the pointer.
+    pub fn preview_label(&self) -> String {
+        match self {
+            DropItem::Files(paths) if paths.len() == 1 => paths[0].clone(),
+            DropItem::Files(paths) => format!("{} files", paths.len()),
+            DropItem::Hunk { path, .. } => format!("Hunk in {path}"),
+            DropItem::Commit(sha) => sha.chars().take(7).collect(),
+            DropItem::Branch(name) => name.clone(),
+        }
+    }
 }
 
 /// Inline reword. Enter saves, Escape cancels.
@@ -565,12 +589,86 @@ impl Store {
             for path in self.paths_between(&anchor, path) {
                 self.marked.insert(path);
             }
+            self.mark_anchor = Some(anchor);
             return;
         }
         if !self.marked.remove(path) {
             self.marked.insert(path.to_string());
         }
         self.mark_anchor = Some(path.to_string());
+    }
+
+    /// Remember the file a plain click opened, so the next Shift-click can
+    /// grow a range from it. The file is not marked until Shift or Ctrl.
+    pub fn arm_mark(&mut self, path: &str) {
+        self.mark_anchor = Some(path.to_string());
+    }
+
+    /// Shift and an arrow. The anchor stays put. Moving back toward it drops
+    /// the file that was at the far end, the way GitButler's file list does.
+    pub(crate) fn extend_marks(&mut self, delta: i32) -> bool {
+        if self.pane != Pane::Uncommitted || delta == 0 {
+            return false;
+        }
+        let paths = self.visible_file_paths();
+        if paths.is_empty() {
+            return false;
+        }
+        let Some(current) = self.uncommitted_path() else {
+            return false;
+        };
+        let Some(pos) = paths.iter().position(|path| path == &current) else {
+            return false;
+        };
+        let next = (pos as i32 + delta).clamp(0, paths.len() as i32 - 1) as usize;
+        let already = self.marked.contains(&current);
+        if next == pos && already && self.mark_anchor.is_some() {
+            return false;
+        }
+        self.bump_marks();
+        if self.mark_anchor.is_none() {
+            self.mark_anchor = Some(current.clone());
+        }
+        if !already {
+            self.marked.insert(current.clone());
+        }
+        if next == pos {
+            return true;
+        }
+        let anchor = self.mark_anchor.clone().unwrap_or(current);
+        let anchor_pos = paths.iter().position(|path| path == &anchor).unwrap_or(pos);
+        let shrinking = if delta > 0 {
+            pos < anchor_pos
+        } else {
+            pos > anchor_pos
+        };
+        if shrinking && self.marked.len() > 1 {
+            self.marked.remove(&paths[pos]);
+        }
+        let head = paths[next].clone();
+        self.marked.insert(head.clone());
+        self.place_uncommitted(&head);
+        true
+    }
+
+    /// ⌘A on the file list. Every visible file joins the selection.
+    pub(crate) fn select_visible_files(&mut self) -> bool {
+        if self.pane != Pane::Uncommitted {
+            return false;
+        }
+        let paths = self.visible_file_paths();
+        if paths.is_empty() {
+            return false;
+        }
+        let before = self.marked.len();
+        self.bump_marks();
+        for path in &paths {
+            self.marked.insert(path.clone());
+        }
+        if self.mark_anchor.is_none() {
+            self.mark_anchor = paths.first().cloned();
+        }
+        self.marked.len() != before
     }
 
     pub fn toggle_hunk_mark(&mut self, path: &str, header: &str) {
@@ -954,6 +1052,246 @@ impl Store {
         Effect::None
     }
 
+    /// Drag payload for one file. A multi-file mark that includes it drags the mark.
+    pub fn file_drag(&self, path: &str) -> DropItem {
+        let path = path.to_string();
+        self.paths_drag(std::slice::from_ref(&path))
+    }
+
+    /// Drag payload for a folder or a lane group.
+    pub fn paths_drag(&self, paths: &[String]) -> DropItem {
+        let paths = if self.marked.len() > 1 && paths.iter().any(|path| self.marked.contains(path))
+        {
+            self.marked.iter().cloned().collect()
+        } else {
+            paths.to_vec()
+        };
+        DropItem::Files(paths)
+    }
+
+    /// Assign files or a hunk to `lane` (`None` clears the lane), or move a commit onto it.
+    pub fn drop_on_lane(&mut self, item: &DropItem, lane: Option<&str>) -> Result<Effect, String> {
+        if let Some(reason) = self.mutation_blocked() {
+            return Err(reason.to_string());
+        }
+        let lane_name = lane.map(str::trim).filter(|name| !name.is_empty());
+        if let Some(name) = lane_name
+            && !self.lane_names().iter().any(|have| have == name)
+        {
+            return Err(format!("No lane named {name}"));
+        }
+        match item {
+            DropItem::Files(paths) => {
+                let selections = self.specs_for(paths);
+                if selections.is_empty() {
+                    return Err(format!("No uncommitted change for {}", paths.join(", ")));
+                }
+                Ok(Effect::Mutate(Action::Assign {
+                    selections,
+                    lane: lane_name.map(str::to_string),
+                }))
+            }
+            DropItem::Hunk { path, header } => {
+                let spec = self
+                    .worktree
+                    .as_ref()
+                    .and_then(|worktree| worktree.files.iter().find(|file| file.path == *path))
+                    .and_then(|file| hunk_spec(file, &[header.as_str()]))
+                    .ok_or_else(|| "This hunk is no longer in the worktree.".to_string())?;
+                Ok(Effect::Mutate(Action::Assign {
+                    selections: vec![spec],
+                    lane: lane_name.map(str::to_string),
+                }))
+            }
+            DropItem::Commit(sha) => {
+                let Some(name) = lane_name else {
+                    return Err("Drop a commit on a lane.".to_string());
+                };
+                let sha = self.resolve_sha(sha);
+                if !self.commit_exists(&sha) {
+                    return Err(format!("No commit {sha}"));
+                }
+                if self
+                    .locate_commit(&sha)
+                    .is_some_and(|(here, _, _)| here == name)
+                {
+                    return Ok(Effect::None);
+                }
+                Ok(Effect::Mutate(Action::MoveCommit {
+                    sha,
+                    anchor: Anchor::Lane(name.to_string()),
+                }))
+            }
+            DropItem::Branch(_) => {
+                Err("Drop a branch above or below another branch or commit.".to_string())
+            }
+        }
+    }
+
+    /// Place a commit just above `target` (newer side). A file or hunk assigns to that commit's lane.
+    pub fn drop_before_commit(&mut self, item: &DropItem, target: &str) -> Result<Effect, String> {
+        self.drop_beside_commit(item, target, false)
+    }
+
+    /// Place a commit or branch above (`below` is false) or below `target`.
+    /// A file or hunk assigns to that commit's lane.
+    pub fn drop_beside_commit(
+        &mut self,
+        item: &DropItem,
+        target: &str,
+        below: bool,
+    ) -> Result<Effect, String> {
+        if let Some(reason) = self.mutation_blocked() {
+            return Err(reason.to_string());
+        }
+        let target_sha = self.resolve_sha(target);
+        if !self.commit_exists(&target_sha) {
+            return Err(format!("No commit {target_sha}"));
+        }
+        match item {
+            DropItem::Commit(sha) => {
+                let sha = self.resolve_sha(sha);
+                if !self.commit_exists(&sha) {
+                    return Err(format!("No commit {sha}"));
+                }
+                if sha == target_sha {
+                    return Ok(Effect::None);
+                }
+                if let (Some((from_lane, from_index, _)), Some((to_lane, to_index, _))) =
+                    (self.locate_commit(&sha), self.locate_commit(&target_sha))
+                    && from_lane == to_lane
+                    && if below {
+                        from_index == to_index + 1
+                    } else {
+                        from_index + 1 == to_index
+                    }
+                {
+                    return Ok(Effect::None);
+                }
+                Ok(Effect::Mutate(Action::MoveCommit {
+                    sha,
+                    anchor: Anchor::Commit {
+                        sha: target_sha,
+                        below,
+                    },
+                }))
+            }
+            DropItem::Branch(name) => {
+                let (lane, _, _) = self
+                    .locate_commit(&target_sha)
+                    .ok_or_else(|| format!("No commit {target_sha}"))?;
+                let onto = if below {
+                    self.branch_under(&lane).ok_or_else(|| {
+                        format!(
+                            "{lane} is the bottom branch. Drop on the top half of a branch to stack above it."
+                        )
+                    })?
+                } else {
+                    lane
+                };
+                self.stack_branch(name, &onto)
+            }
+            DropItem::Files(_) | DropItem::Hunk { .. } => {
+                let (lane, _, _) = self
+                    .locate_commit(&target_sha)
+                    .ok_or_else(|| format!("No commit {target_sha}"))?;
+                self.drop_on_lane(item, Some(&lane))
+            }
+        }
+    }
+
+    /// Top half of a branch: a commit goes to the tip, a branch stacks above.
+    /// Bottom half: both land below the branch.
+    pub fn drop_beside_branch(
+        &mut self,
+        item: &DropItem,
+        branch: &str,
+        below: bool,
+    ) -> Result<Effect, String> {
+        if let Some(reason) = self.mutation_blocked() {
+            return Err(reason.to_string());
+        }
+        self.ensure_lane(branch)?;
+        match item {
+            DropItem::Files(_) | DropItem::Hunk { .. } => self.drop_on_lane(item, Some(branch)),
+            DropItem::Commit(sha) => {
+                let sha = self.resolve_sha(sha);
+                if !self.commit_exists(&sha) {
+                    return Err(format!("No commit {sha}"));
+                }
+                if !below {
+                    return self.drop_on_lane(&DropItem::Commit(sha), Some(branch));
+                }
+                let Some(oldest) = self.oldest_commit(branch) else {
+                    return self.drop_on_lane(&DropItem::Commit(sha), Some(branch));
+                };
+                if sha == oldest {
+                    return Ok(Effect::None);
+                }
+                Ok(Effect::Mutate(Action::MoveCommit {
+                    sha,
+                    anchor: Anchor::Commit {
+                        sha: oldest,
+                        below: true,
+                    },
+                }))
+            }
+            DropItem::Branch(name) => {
+                let onto = if below {
+                    self.branch_under(branch).ok_or_else(|| {
+                        format!(
+                            "{branch} is the bottom branch. Drop on the top half of a branch to stack above it."
+                        )
+                    })?
+                } else {
+                    branch.to_string()
+                };
+                self.stack_branch(name, &onto)
+            }
+        }
+    }
+
+    /// Stack `name` on top of `onto`. GitButler's move places the subject above the target.
+    fn stack_branch(&mut self, name: &str, onto: &str) -> Result<Effect, String> {
+        if name == onto || self.branch_under(name).as_deref() == Some(onto) {
+            return Ok(Effect::None);
+        }
+        self.ensure_lane(name)?;
+        self.ensure_lane(onto)?;
+        Ok(Effect::Mutate(Action::MoveBranch {
+            name: name.to_string(),
+            anchor: BranchAnchor::Reference {
+                name: onto.to_string(),
+                below: false,
+            },
+        }))
+    }
+
+    /// The branch under `name` in the same stack. Tip is index 0, so this is the next one.
+    fn branch_under(&self, name: &str) -> Option<String> {
+        let workspace = self.workspace.as_ref()?;
+        for stack in &workspace.stacks {
+            let Some(index) = stack.branches.iter().position(|branch| branch.name == name) else {
+                continue;
+            };
+            return stack
+                .branches
+                .get(index + 1)
+                .map(|branch| branch.name.clone());
+        }
+        None
+    }
+
+    fn oldest_commit(&self, branch: &str) -> Option<String> {
+        self.workspace.as_ref()?.stacks.iter().find_map(|stack| {
+            stack
+                .branches
+                .iter()
+                .find(|have| have.name == branch)
+                .and_then(|have| have.commits.last().map(|commit| commit.sha.clone()))
+        })
+    }
+
     pub fn open_lane_actions(&mut self, name: &str) -> Result<(), String> {
         self.ensure_lane(name)?;
         self.open_menu(MenuKind::LaneActions {
@@ -1196,6 +1534,16 @@ pub fn perform_action(
             done.focus_sha = Some(sha.clone());
             Ok(done)
         }
+        Action::MoveBranch { name, anchor } => {
+            let result = backend.move_branch(id, name, anchor).map_err(bridge_err)?;
+            let worktree = read_worktree(backend, id)?;
+            Ok(done(
+                result.workspace,
+                worktree,
+                vec![format!("move {name}")],
+                None,
+            ))
+        }
         Action::InsertBlank { anchor } => {
             let result = backend.insert_blank(id, anchor).map_err(bridge_err)?;
             let worktree = read_worktree(backend, id)?;
@@ -1363,7 +1711,7 @@ fn action_op(action: &Action) -> &'static str {
         Action::Reword { .. } => "reword",
         Action::Squash { .. } => "squash",
         Action::Uncommit { .. } => "uncommit",
-        Action::MoveCommit { .. } => "move",
+        Action::MoveCommit { .. } | Action::MoveBranch { .. } => "move",
         Action::InsertBlank { .. } => "blank",
         Action::Undo => "undo",
     }
@@ -1381,6 +1729,7 @@ pub(crate) fn mutation_activity(action: &Action) -> (&'static str, Option<String
         Action::Squash { .. } => "squash",
         Action::Uncommit { .. } => "uncommit",
         Action::MoveCommit { .. } => "move_commit",
+        Action::MoveBranch { .. } => "move_branch",
         Action::InsertBlank { .. } => "insert_blank",
         Action::Undo => "undo_last",
     };
@@ -1397,6 +1746,7 @@ fn action_row(action: &Action) -> Option<String> {
         | Action::Squash { subject: sha, .. }
         | Action::Uncommit { sha }
         | Action::MoveCommit { sha, .. } => Some(sha.clone()),
+        Action::MoveBranch { name, .. } => Some(name.clone()),
         Action::Commit { selections, .. } => selections.first().map(|spec| spec.path.clone()),
         Action::CreateLane { commit, assign, .. } => commit
             .as_ref()
@@ -2180,10 +2530,6 @@ impl Store {
             "Return this commit's changes to the worktree".to_string(),
             true,
         );
-        let (move_tip, move_on) = gate(
-            "Move this commit to another lane or reorder it".to_string(),
-            true,
-        );
         let (blank_tip, blank_on) = gate(
             "Insert an empty commit just newer than this one".to_string(),
             true,
@@ -2222,13 +2568,6 @@ impl Store {
                 kind: EntryKind::Uncommit,
             },
             MenuEntry {
-                label: "Move…".to_string(),
-                tip: move_tip,
-                enabled: move_on,
-                destructive: false,
-                kind: EntryKind::OpenMove,
-            },
-            MenuEntry {
                 label: "Insert blank commit".to_string(),
                 tip: blank_tip,
                 enabled: blank_on,
@@ -2260,8 +2599,6 @@ impl Store {
     }
 
     fn file_action_entries(&self, paths: &[String]) -> Vec<MenuEntry> {
-        let (move_tip, move_on) =
-            self.gated("Move the selection to another lane".to_string(), true);
         let has_changes = !self.specs_for(paths).is_empty();
         let (discard_tip, discard_on) = self.gated(
             if has_changes {
@@ -2271,26 +2608,16 @@ impl Store {
             },
             has_changes,
         );
-        vec![
-            MenuEntry {
-                label: "Move to…".to_string(),
-                tip: move_tip,
-                enabled: move_on,
-                destructive: false,
-                kind: EntryKind::OpenMoveFiles,
-            },
-            MenuEntry {
-                label: "Discard".to_string(),
-                tip: discard_tip,
-                enabled: discard_on,
-                destructive: true,
-                kind: EntryKind::DiscardFiles,
-            },
-        ]
+        vec![MenuEntry {
+            label: "Discard".to_string(),
+            tip: discard_tip,
+            enabled: discard_on,
+            destructive: true,
+            kind: EntryKind::DiscardFiles,
+        }]
     }
 
     fn hunk_action_entries(&self, path: &str, header: &str) -> Vec<MenuEntry> {
-        let (move_tip, move_on) = self.gated("Move this hunk to another lane".to_string(), true);
         let present = self
             .worktree
             .as_ref()
@@ -2305,22 +2632,13 @@ impl Store {
             },
             present,
         );
-        vec![
-            MenuEntry {
-                label: "Move hunk".to_string(),
-                tip: move_tip,
-                enabled: move_on,
-                destructive: false,
-                kind: EntryKind::OpenMoveHunk,
-            },
-            MenuEntry {
-                label: "Discard hunk".to_string(),
-                tip: discard_tip,
-                enabled: discard_on,
-                destructive: true,
-                kind: EntryKind::DiscardHunk,
-            },
-        ]
+        vec![MenuEntry {
+            label: "Discard hunk".to_string(),
+            tip: discard_tip,
+            enabled: discard_on,
+            destructive: true,
+            kind: EntryKind::DiscardHunk,
+        }]
     }
 
     fn lane_action_entries(&self, name: &str) -> Vec<MenuEntry> {
@@ -2560,14 +2878,6 @@ impl Store {
                 self.menu = None;
                 self.request_uncommit()
             }
-            EntryKind::OpenMove => {
-                let sha = self.menu_sha();
-                self.menu = None;
-                if let Some(sha) = sha {
-                    self.open_menu(MenuKind::MoveCommit { sha });
-                }
-                Effect::None
-            }
             EntryKind::InsertBlank => {
                 let sha = self.menu_sha();
                 self.menu = None;
@@ -2618,27 +2928,10 @@ impl Store {
                 self.menu = None;
                 self.confirm_amend(sha)
             }
-            EntryKind::OpenMoveFiles => {
-                let paths = self.menu_paths();
-                if paths.is_empty() {
-                    self.menu = None;
-                    return Effect::None;
-                }
-                self.open_menu(MenuKind::MoveFiles { paths });
-                Effect::None
-            }
             EntryKind::DiscardFiles => {
                 let paths = self.menu_paths();
                 self.menu = None;
                 self.ask_discard_paths(paths)
-            }
-            EntryKind::OpenMoveHunk => {
-                let Some((path, header)) = self.menu_hunk() else {
-                    self.menu = None;
-                    return Effect::None;
-                };
-                self.open_menu(MenuKind::MoveHunk { path, header });
-                Effect::None
             }
             EntryKind::DiscardHunk => {
                 let Some((path, header)) = self.menu_hunk() else {
@@ -2989,7 +3282,7 @@ fn edit_text(buffer: &mut String, key: &str) {
 mod tests {
     use super::*;
     use crate::store::{AppPage, EditPhase, Loaded, Store, ViewMode, load};
-    use gb_bridge::{AssignedHunk, BranchSummary, FakeBackend, FileStatus, StackSummary};
+    use gb_bridge::{Anchor, AssignedHunk, BranchSummary, FakeBackend, FileStatus, StackSummary};
 
     fn ready() -> (FakeBackend, Store) {
         let backend = FakeBackend::demo();
@@ -3490,26 +3783,276 @@ mod tests {
     }
 
     #[test]
-    fn file_menu_marks_discard_and_locks_while_editing() {
+    fn file_menu_is_discard_and_locks_while_editing() {
         let (_backend, mut store) = ready();
         store.open_file_actions("src/app.rs");
         let entries = store.menu_entries();
-        let move_to = entries
-            .iter()
-            .find(|entry| entry.label == "Move to…")
-            .unwrap();
-        assert!(move_to.enabled && !move_to.destructive);
-        let discard = entries
-            .iter()
-            .find(|entry| entry.label == "Discard")
-            .unwrap();
+        assert!(entries.iter().all(|entry| entry.label != "Move to…"));
+        assert_eq!(entries.len(), 1);
+        let discard = &entries[0];
+        assert_eq!(discard.label, "Discard");
         assert!(discard.destructive && discard.enabled && !discard.tip.is_empty());
+        store.open_hunk_actions("src/app.rs", "@@ -1,4 +1,154 @@");
+        let hunks = store.menu_entries();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].label, "Discard hunk");
         store.pages.phase = EditPhase::Editing;
         store.open_file_actions("src/app.rs");
         for entry in store.menu_entries() {
             assert!(!entry.enabled, "{}", entry.label);
             assert!(!entry.tip.is_empty(), "{}", entry.label);
         }
+    }
+
+    #[test]
+    fn dropping_a_file_on_a_lane_assigns_it() {
+        let (backend, mut store) = ready();
+        let effect = store
+            .drop_on_lane(&store.file_drag("README.md"), Some("lane-b"))
+            .unwrap();
+        run(&backend, &mut store, effect);
+        assert_eq!(file(&store, "README.md").lanes(), ["lane-b"]);
+    }
+
+    #[test]
+    fn dropping_a_file_on_uncommitted_clears_its_lane() {
+        let (backend, mut store) = ready();
+        let effect = store
+            .drop_on_lane(&store.file_drag("README.md"), None)
+            .unwrap();
+        run(&backend, &mut store, effect);
+        assert!(file(&store, "README.md").lanes().is_empty());
+    }
+
+    #[test]
+    fn dropping_a_hunk_clears_only_that_hunk() {
+        let (backend, mut store) = ready();
+        let item = DropItem::Hunk {
+            path: "src/split.rs".to_string(),
+            header: "@@ -8,2 +10,4 @@".to_string(),
+        };
+        let effect = store.drop_on_lane(&item, None).unwrap();
+        run(&backend, &mut store, effect);
+        let split = file(&store, "src/split.rs");
+        let cleared = split
+            .hunks
+            .iter()
+            .find(|hunk| hunk.header == "@@ -8,2 +10,4 @@")
+            .unwrap();
+        assert!(cleared.lane.is_none());
+        let kept = split
+            .hunks
+            .iter()
+            .find(|hunk| hunk.header == "@@ -1,2 +1,4 @@")
+            .unwrap();
+        assert_eq!(kept.lane.as_deref(), Some("lane-a"));
+    }
+
+    #[test]
+    fn dropping_a_commit_on_another_lane_moves_it() {
+        let (backend, mut store) = ready();
+        let sha = store.commit_sha_at(0).unwrap();
+        let effect = store
+            .drop_on_lane(&DropItem::Commit(sha.clone()), Some("lane-b"))
+            .unwrap();
+        run(&backend, &mut store, effect);
+        let (lane, _, _) = store.locate_commit(&sha).unwrap();
+        assert_eq!(lane, "lane-b");
+    }
+
+    #[test]
+    fn dropping_a_commit_on_its_own_lane_does_nothing() {
+        let (_backend, mut store) = ready();
+        let sha = store.commit_sha_at(0).unwrap();
+        let (lane, _, _) = store.locate_commit(&sha).unwrap();
+        let effect = store
+            .drop_on_lane(&DropItem::Commit(sha.clone()), Some(lane.as_str()))
+            .unwrap();
+        assert_eq!(effect, Effect::None);
+        let same = store
+            .drop_before_commit(&DropItem::Commit(sha.clone()), &sha)
+            .unwrap();
+        assert_eq!(same, Effect::None);
+    }
+
+    #[test]
+    fn dropping_a_commit_just_above_another_uses_the_newer_side() {
+        let (backend, mut store) = ready();
+        let tip = store.commit_sha_at(0).unwrap();
+        let (_, _, commits) = store.locate_commit(&tip).unwrap();
+        let older = commits[1].sha.clone();
+        let already = store
+            .drop_before_commit(&DropItem::Commit(tip.clone()), &older)
+            .unwrap();
+        assert_eq!(already, Effect::None);
+
+        let effect = store
+            .drop_before_commit(&DropItem::Commit(older.clone()), &tip)
+            .unwrap();
+        match &effect {
+            Effect::Mutate(Action::MoveCommit { sha, anchor }) => {
+                assert_eq!(sha, &older);
+                assert_eq!(
+                    anchor,
+                    &Anchor::Commit {
+                        sha: tip.clone(),
+                        below: false,
+                    }
+                );
+            }
+            other => panic!("expected a move, got {other:?}"),
+        }
+        run(&backend, &mut store, effect);
+        let (lane, index, commits) = store.locate_commit(&older).unwrap();
+        assert_eq!(lane, "lane-a");
+        assert_eq!(index, 0);
+        assert_eq!(commits[1].sha, tip);
+    }
+
+    #[test]
+    fn dropping_a_commit_on_the_bottom_half_places_it_below() {
+        let (backend, mut store) = ready();
+        let tip = store.commit_sha_at(0).unwrap();
+        let (_, _, commits) = store.locate_commit(&tip).unwrap();
+        let older = commits[1].sha.clone();
+        let effect = store
+            .drop_beside_commit(&DropItem::Commit(tip.clone()), &older, true)
+            .unwrap();
+        run(&backend, &mut store, effect);
+        let (_, index, commits) = store.locate_commit(&tip).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(commits[0].sha, older);
+    }
+
+    #[test]
+    fn dropping_a_branch_above_another_stacks_it_on_top() {
+        let (backend, mut store) = ready();
+        let effect = store
+            .drop_beside_branch(&DropItem::Branch("lane-c".to_string()), "lane-a", false)
+            .unwrap();
+        run(&backend, &mut store, effect);
+        let order: Vec<_> = store
+            .workspace
+            .as_ref()
+            .unwrap()
+            .stacks
+            .iter()
+            .find(|stack| stack.names().any(|name| name == "lane-a"))
+            .unwrap()
+            .names()
+            .collect();
+        assert_eq!(order, ["lane-c", "lane-a"]);
+    }
+
+    #[test]
+    fn dropping_a_branch_on_the_bottom_half_lands_above_the_branch_under_it() {
+        let (backend, mut store) = ready();
+        let stacked = store
+            .drop_beside_branch(&DropItem::Branch("lane-b".to_string()), "lane-a", false)
+            .unwrap();
+        run(&backend, &mut store, stacked);
+        let effect = store
+            .drop_beside_branch(&DropItem::Branch("lane-c".to_string()), "lane-b", true)
+            .unwrap();
+        run(&backend, &mut store, effect);
+        let order: Vec<_> = store
+            .workspace
+            .as_ref()
+            .unwrap()
+            .stacks
+            .iter()
+            .find(|stack| stack.names().any(|name| name == "lane-a"))
+            .unwrap()
+            .names()
+            .collect();
+        assert_eq!(order, ["lane-b", "lane-c", "lane-a"]);
+    }
+
+    #[test]
+    fn dropping_a_branch_below_the_bottom_branch_explains_why() {
+        let (_backend, mut store) = ready();
+        let error = store
+            .drop_beside_branch(&DropItem::Branch("lane-b".to_string()), "lane-a", true)
+            .unwrap_err();
+        assert!(error.contains("bottom"), "{error}");
+    }
+
+    #[test]
+    fn dropping_a_file_on_a_commit_assigns_that_lane() {
+        let (backend, mut store) = ready();
+        let sha = store
+            .workspace
+            .as_ref()
+            .unwrap()
+            .stacks
+            .iter()
+            .flat_map(|stack| &stack.branches)
+            .find(|branch| branch.name == "lane-b")
+            .unwrap()
+            .commits[0]
+            .sha
+            .clone();
+        let effect = store
+            .drop_before_commit(&store.file_drag("README.md"), &sha)
+            .unwrap();
+        run(&backend, &mut store, effect);
+        assert_eq!(file(&store, "README.md").lanes(), ["lane-b"]);
+    }
+
+    #[test]
+    fn dropping_a_commit_on_unassigned_explains_why() {
+        let (_backend, mut store) = ready();
+        let sha = store.commit_sha_at(0).unwrap();
+        let error = store
+            .drop_on_lane(&DropItem::Commit(sha), None)
+            .unwrap_err();
+        assert!(error.contains("lane"), "{error}");
+    }
+
+    #[test]
+    fn an_edit_blocks_a_drop() {
+        let (_backend, mut store) = ready();
+        store.pages.phase = EditPhase::Editing;
+        let error = store
+            .drop_on_lane(&store.file_drag("README.md"), Some("lane-b"))
+            .unwrap_err();
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn a_marked_drag_includes_every_marked_file() {
+        let (_backend, mut store) = ready();
+        store.mark_click("README.md", false);
+        store.mark_click("src/app.rs", false);
+        let DropItem::Files(paths) = store.file_drag("README.md") else {
+            panic!("file drag");
+        };
+        assert!(paths.iter().any(|path| path == "README.md"));
+        assert!(paths.iter().any(|path| path == "src/app.rs"));
+        assert_eq!(paths.len(), 2);
+        let DropItem::Files(alone) = store.file_drag("src/util.rs") else {
+            panic!("file drag");
+        };
+        assert_eq!(alone, vec!["src/util.rs".to_string()]);
+    }
+
+    #[test]
+    fn keyboard_move_still_opens_the_lane_list() {
+        let (_backend, mut store) = ready();
+        store.focus_file("README.md");
+        store.apply_key("m");
+        assert!(matches!(
+            store.menu.as_ref().map(|menu| &menu.kind),
+            Some(MenuKind::MoveFiles { .. })
+        ));
+        let labels: Vec<_> = store
+            .menu_entries()
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect();
+        assert!(labels.iter().any(|label| label == "lane-b"));
+        assert!(labels.iter().any(|label| label == "Unassigned"));
+        assert!(labels.iter().any(|label| label == "New lane…"));
     }
 
     #[test]
@@ -3549,6 +4092,12 @@ mod tests {
 
         let tip = store.commit_sha_at(0).unwrap();
         store.open_actions_for(&tip).unwrap();
+        assert!(
+            store
+                .menu_entries()
+                .iter()
+                .all(|entry| entry.label != "Move…")
+        );
         let squash = store
             .menu_entries()
             .into_iter()
@@ -3607,7 +4156,7 @@ mod tests {
     fn menu_arrows_and_escape_stay_on_the_branches_page() {
         let (_backend, mut store) = ready();
         store.show_page(AppPage::Branches);
-        store.open_file_actions("src/app.rs");
+        store.open_lane_actions("lane-a").unwrap();
         assert_eq!(store.menu_cursor(), 0);
         store.apply_key("down");
         assert_eq!(store.menu_cursor(), 1);

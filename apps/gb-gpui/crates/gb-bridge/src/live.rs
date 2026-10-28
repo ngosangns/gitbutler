@@ -75,6 +75,29 @@ pub(crate) fn commit_details(source: VersionSource, id: &str, sha: &str) -> Resu
     })
 }
 
+/// Files the branch changes against its base. This is GitButler's branch diff
+/// (`branch_diff` / "All changes"), not the sum of each commit.
+pub(crate) fn branch_files(source: VersionSource, id: &str, name: &str) -> Result<Vec<CommitFile>> {
+    let ctx = open_context(source, id)?;
+    let changes = but_api::branch::branch_diff(&ctx, name.to_string()).map_err(|error| {
+        BridgeError::not_found(format!("Could not read changes on {name}: {error}"))
+    })?;
+    let repo = ctx.repo.get().map_err(|error| {
+        BridgeError::internal(format!("Could not open the repository: {error}"))
+    })?;
+    let lines = ctx.settings.context_lines;
+    let mut files = changes
+        .changes
+        .iter()
+        .map(|change| {
+            let core: but_core::TreeChange = change.clone().into();
+            commit_file(&repo, lines, &core)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
 pub(crate) fn file_diff(source: VersionSource, id: &str, request: DiffRequest) -> Result<TextDiff> {
     let ctx = open_context(source, id)?;
     match request {
@@ -118,6 +141,28 @@ pub(crate) fn file_diff(source: VersionSource, id: &str, request: DiffRequest) -
                 BridgeError::internal(format!("Could not open the repository: {error}"))
             })?;
             let patch = change
+                .unified_patch(&repo, ctx.settings.context_lines)
+                .map_err(|error| {
+                    BridgeError::internal(format!("Could not diff {path}: {error}"))
+                })?;
+            Ok(text_diff(path, patch))
+        }
+        DiffRequest::Branch { name, path } => {
+            let changes = but_api::branch::branch_diff(&ctx, name.clone()).map_err(|error| {
+                BridgeError::not_found(format!("Could not read changes on {name}: {error}"))
+            })?;
+            let change = changes
+                .changes
+                .into_iter()
+                .find(|change| lossy_bytes(AsRef::<[u8]>::as_ref(&change.path)) == path)
+                .ok_or_else(|| {
+                    BridgeError::not_found(format!("{path} is not part of branch {name}"))
+                })?;
+            let core: but_core::TreeChange = change.into();
+            let repo = ctx.repo.get().map_err(|error| {
+                BridgeError::internal(format!("Could not open the repository: {error}"))
+            })?;
+            let patch = core
                 .unified_patch(&repo, ctx.settings.context_lines)
                 .map_err(|error| {
                     BridgeError::internal(format!("Could not diff {path}: {error}"))

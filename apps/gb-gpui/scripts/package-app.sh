@@ -94,9 +94,11 @@ check_bundle() {
   [ -f "$exe" ] || die "executable is missing: $exe" 1
   [ -x "$exe" ] || die "executable is not executable: $exe" 1
   [ -s "$OUT/Contents/Resources/AppIcon.icns" ] || die "AppIcon.icns is missing or empty" 1
+  local helper="$OUT/Contents/MacOS/gitbutler-git-askpass"
+  [ -x "$helper" ] || die "askpass helper is missing or not executable: $helper" 1
   local askpass="$OUT/Contents/Resources/ASKPASS.txt"
   [ -s "$askpass" ] || die "ASKPASS.txt is missing or empty" 1
-  grep -q "gb-bridge-askpass-stub" "$askpass" || die "ASKPASS.txt does not name the runtime stub" 1
+  grep -q "gitbutler-git-askpass" "$askpass" || die "ASKPASS.txt does not name gitbutler-git-askpass" 1
   grep -q "GITBUTLER_ASKPASS_BIN" "$askpass" || die "ASKPASS.txt does not name GITBUTLER_ASKPASS_BIN" 1
 
   local key expected actual
@@ -158,17 +160,18 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp "$SRC_BIN" "$STAGE/Contents/MacOS/$NAME"
 chmod 755 "$STAGE/Contents/MacOS/$NAME"
+ASKPASS_SRC="$(dirname "$SRC_BIN")/gitbutler-git-askpass"
+[ -x "$ASKPASS_SRC" ] || die "askpass helper missing beside the app binary: $ASKPASS_SRC" 1
+cp "$ASKPASS_SRC" "$STAGE/Contents/MacOS/gitbutler-git-askpass"
+chmod 755 "$STAGE/Contents/MacOS/gitbutler-git-askpass"
 python3 "$ICON_PY" "$ICON_SRC" "$STAGE/Contents/Resources/AppIcon.icns"
 cat >"$STAGE/Contents/Resources/ASKPASS.txt" <<'EOF'
-gb-gpui does not ship an askpass helper in this bundle.
+gb-gpui ships gitbutler-git-askpass beside the app executable.
 
-When a fetch needs a helper on disk, gb-bridge writes a stub at
-$TMPDIR/gb-bridge-askpass-stub. The stub is a shell script that exits 0.
-The bridge sets GITBUTLER_ASKPASS_BIN to that path only when the variable
-is already unset.
+Git runs that helper when a fetch or push asks for a password. The helper
+talks to this app, and the password is typed into the app dialog.
 
-A password prompt is answered in the app window. The stub does not collect
-a password. Set GITBUTLER_ASKPASS_BIN before launch to keep another helper.
+GITBUTLER_ASKPASS_BIN overrides that path when it already points at a file.
 EOF
 cat >"$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

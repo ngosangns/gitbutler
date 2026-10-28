@@ -15,6 +15,7 @@ mod ui;
 
 use perf_harness::{PerfRun, RenderClock};
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -23,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ely_gpui_component::buttons::{ButtonVariant, IconButton};
+use ely_gpui_component::forms::{Input, InputEvent, TextInput};
 use ely_gpui_component::layout::{ScrollArea, Scrollbar};
 use ely_gpui_component::primitives::{Icon, IconName, Tooltip};
 use ely_gpui_component::shell::StatusBar;
@@ -32,16 +34,17 @@ use gb_bridge::{
     FileChange, FileStatus, ForcePush, InProcessBackend, StackSummary,
 };
 use gpui::{
-    App, Axis, ClickEvent, ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollHandle,
-    ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window, div, point, prelude::*,
-    px, uniform_list,
+    App, Axis, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, HighlightStyle,
+    IntoElement, KeyDownEvent, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollHandle, ScrollStrategy,
+    SharedString, Styled, StyledText, TextLayout, UniformListScrollHandle, Window, div, point,
+    prelude::*, px, uniform_list,
 };
 use ns_ui::Tone;
 use store::{
-    Action, AppPage, BranchFocusInfo, BranchTab, DiffRow, EditPhase, Effect, Field, PageOp, Pane,
-    RemoteOp, RowKind, SettingsSection, ShownFile, SideFocus, Store, TreeRow, ViewMode,
-    build_diff_rows, collapse_key, load, perform_settings, shortcut_rows, snapshot_kind,
+    Action, AppPage, BranchFocusInfo, BranchTab, DiffRow, DropItem, EditPhase, Effect, Field,
+    PageOp, Pane, RemoteOp, RowKind, SettingsSection, ShownFile, SideFocus, Store, TreeRow,
+    ViewMode, build_diff_rows, collapse_key, load, perform_settings, shortcut_rows, snapshot_kind,
     snapshot_when,
 };
 
@@ -51,6 +54,41 @@ struct ColumnDrag {
     origin_x: f32,
     origin: [f32; 3],
     viewport: f32,
+}
+
+/// A pointer selection in the open diff. Bytes are indexes into that line's text.
+struct DiffPick {
+    anchor_line: usize,
+    anchor_byte: usize,
+    head_line: usize,
+    head_byte: usize,
+    dragging: bool,
+}
+
+impl DiffPick {
+    fn idle() -> Self {
+        Self {
+            anchor_line: 0,
+            anchor_byte: 0,
+            head_line: 0,
+            head_byte: 0,
+            dragging: false,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.anchor_line != self.head_line || self.anchor_byte != self.head_byte
+    }
+
+    fn ordered(&self) -> (usize, usize, usize, usize) {
+        let anchor = (self.anchor_line, self.anchor_byte);
+        let head = (self.head_line, self.head_byte);
+        if anchor <= head {
+            (anchor.0, anchor.1, head.0, head.1)
+        } else {
+            (head.0, head.1, anchor.0, anchor.1)
+        }
+    }
 }
 
 fn main() {
@@ -79,14 +117,12 @@ fn main() {
 /// The text box still shows every character at once.
 const BRANCH_FILTER_DEBOUNCE_MS: u64 = 130;
 
-/// Height of the "Changed files" pane on the history page.
-const SNAPSHOT_FILES_PX: f32 = 88.0;
-
-/// One snapshot file row plus its gap, as the old gap_2 flex column laid out.
-const SNAPSHOT_FILE_PITCH_PX: f32 = 24.0;
-
 struct GbWindow {
     focus: FocusHandle,
+    /// The native branches-page filter box. Real caret, selection, and clipboard.
+    branch_filter_input: gpui::Entity<TextInput>,
+    /// Mirrors the input's text into the store and tracks its focus.
+    _branch_filter_sub: gpui::Subscription,
     watch: Option<gb_bridge::WatchHandle>,
     askpass_watch: Option<gb_bridge::AskpassWatch>,
     backend: Arc<dyn Backend>,
@@ -108,6 +144,11 @@ struct GbWindow {
     branch_list_scroll: UniformListScrollHandle,
     history_scroll: ScrollHandle,
     history_list_scroll: UniformListScrollHandle,
+    snapshot_file_scroll: UniformListScrollHandle,
+    /// Sha the file list last scrolled for. A new snapshot returns to the top.
+    snapshot_file_for: RefCell<Option<String>>,
+    /// Drag selection in the file diff. ⌘C copies it.
+    diff_pick: Rc<RefCell<DiffPick>>,
     column_drag: Option<ColumnDrag>,
     laid_out: [f32; 3],
     viewport_width: f32,
@@ -132,6 +173,32 @@ impl GbWindow {
         let (askpass_tx, askpass_rx) = mpsc::channel();
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let branch_filter_input =
+            cx.new(|cx| TextInput::new(window, cx).placeholder("Filter branches"));
+        let branch_filter_sub =
+            cx.subscribe(&branch_filter_input, |this, input, event, cx| match event {
+                InputEvent::Changed => {
+                    let text = input.read(cx).text().to_string();
+                    this.store.set_filter_text(&text);
+                    if this.store.branch_filter_pending() {
+                        this.schedule_branch_refilter(cx);
+                    }
+                    cx.notify();
+                }
+                InputEvent::Focus => {
+                    this.store.set_filter_focused(true);
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.store.set_filter_focused(false);
+                    cx.notify();
+                }
+                InputEvent::Submit => {
+                    let effect = this.store.primary_branch_action();
+                    this.activate(effect, cx);
+                    cx.notify();
+                }
+            });
         let preview = backend.is_preview();
         let ui_path = store::persistent_file();
         let mut store = Store::default();
@@ -141,6 +208,8 @@ impl GbWindow {
         let laid_out = store::column_pixels(store.column_fractions, 1280.0);
         let mut view = Self {
             focus,
+            branch_filter_input,
+            _branch_filter_sub: branch_filter_sub,
             watch: None,
             askpass_watch: None,
             backend,
@@ -161,6 +230,9 @@ impl GbWindow {
             branch_list_scroll: UniformListScrollHandle::new(),
             history_scroll: ScrollHandle::new(),
             history_list_scroll: UniformListScrollHandle::new(),
+            snapshot_file_scroll: UniformListScrollHandle::new(),
+            snapshot_file_for: RefCell::new(None),
+            diff_pick: Rc::new(RefCell::new(DiffPick::idle())),
             column_drag: None,
             laid_out,
             viewport_width: 1280.0,
@@ -465,6 +537,7 @@ impl GbWindow {
             Effect::Refresh => self.refresh(cx),
             Effect::SelectProject(id) => self.select_project(id, cx),
             Effect::ShowCommit(sha) => self.load_commit(sha, cx),
+            Effect::ShowBranch(name) => self.load_branch(name, cx),
             Effect::ShowDiff(request) => self.load_diff(request, cx),
             Effect::Mutate(action) => self.run_action(action, cx),
             Effect::Remote(op) => self.run_remote(op, cx),
@@ -473,6 +546,17 @@ impl GbWindow {
             Effect::Suggest(paths) => self.run_suggest(paths, cx),
             Effect::Settings(op) => self.run_settings(op, cx),
         }
+    }
+
+    fn finish_drop(&mut self, result: Result<Effect, String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(effect) => self.activate(effect, cx),
+            Err(message) => {
+                self.store.toast_bad = true;
+                self.store.toast = Some(message);
+            }
+        }
+        cx.notify();
     }
 
     fn run_forge(&mut self, op: store::ForgeOp, cx: &mut Context<Self>) {
@@ -812,6 +896,29 @@ impl GbWindow {
         .detach();
     }
 
+    fn load_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(id) = self.store.selected.clone() else {
+            return;
+        };
+        self.store
+            .activity
+            .begin("branch_files", Some(name.clone()));
+        let backend = Arc::clone(&self.backend);
+        let wanted = name.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { backend.branch_files(&id, &name) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.store
+                    .set_branch_files(&wanted, result.map_err(|error| error.message));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn load_diff(&mut self, request: DiffRequest, cx: &mut Context<Self>) {
         let Some(id) = self.store.selected.clone() else {
             return;
@@ -846,7 +953,20 @@ impl GbWindow {
         .detach();
     }
 
-    fn on_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+    fn on_key(&mut self, keystroke: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        // While the native filter input is focused, Escape returns focus to the
+        // key router rather than closing the branches page.
+        if self.store.pages.filter_focused
+            && keystroke.key.eq_ignore_ascii_case("escape")
+            && !keystroke.modifiers.modified()
+        {
+            self.focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        if self.diff_select_key(keystroke, cx) {
+            return;
+        }
         let Some(token) = key_token(keystroke) else {
             return;
         };
@@ -867,6 +987,79 @@ impl GbWindow {
         if handled {
             cx.notify();
         }
+    }
+
+    /// ⌘C copies the diff selection. ⌘A selects the open diff when the changes
+    /// pane is focused and no commit field is being edited.
+    fn diff_select_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+        let mods = &keystroke.modifiers;
+        if !mods.platform || mods.shift || mods.control || mods.alt {
+            return false;
+        }
+        if keystroke.key.eq_ignore_ascii_case("c") {
+            return self.copy_diff_selection(cx);
+        }
+        if keystroke.key.eq_ignore_ascii_case("a")
+            && self.store.pane == Pane::Changes
+            && self.store.composer.field.is_none()
+            && !self.store.pages.message_focused
+            && !self.store.diff_rows.is_empty()
+        {
+            self.select_all_diff();
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    fn select_all_diff(&mut self) {
+        let Some(last) = self.store.diff_rows.len().checked_sub(1) else {
+            return;
+        };
+        let end = self.store.diff_rows[last].text.len();
+        *self.diff_pick.borrow_mut() = DiffPick {
+            anchor_line: 0,
+            anchor_byte: 0,
+            head_line: last,
+            head_byte: end,
+            dragging: false,
+        };
+    }
+
+    fn copy_diff_selection(&self, cx: &mut Context<Self>) -> bool {
+        let pick = self.diff_pick.borrow();
+        if !pick.active() {
+            return false;
+        }
+        let (start_line, start_byte, end_line, end_byte) = pick.ordered();
+        let rows = &self.store.diff_rows;
+        if rows.is_empty() || start_line >= rows.len() {
+            return false;
+        }
+        let end_line = end_line.min(rows.len() - 1);
+        let mut parts = Vec::new();
+        for index in start_line..=end_line {
+            let text = rows[index].text.as_str();
+            let start = if index == start_line {
+                snap_byte(text, start_byte)
+            } else {
+                0
+            };
+            let end = if index == end_line {
+                snap_byte(text, end_byte)
+            } else {
+                text.len()
+            };
+            let end = end.max(start);
+            parts.push(text[start..end].to_string());
+        }
+        drop(pick);
+        let copied = parts.join("\n");
+        if copied.is_empty() {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(copied));
+        true
     }
 
     /// Queues a branch-list refilter after the filter goes quiet. A newer
@@ -1000,6 +1193,13 @@ impl GbWindow {
             self.detail_scroll
                 .scroll_to_item(index, ScrollStrategy::Nearest);
         }
+        if self.store.app_page() == AppPage::Branches
+            && self.store.pages.tab != BranchTab::PullRequests
+            && !self.virtual_branches()
+        {
+            self.branch_list_scroll
+                .scroll_to_item(self.store.pages.branch_cursor, ScrollStrategy::Nearest);
+        }
     }
 }
 
@@ -1034,8 +1234,8 @@ impl Render for GbWindow {
         div()
             .id("gb-root")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                this.on_key(&event.keystroke, cx);
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_key(&event.keystroke, window, cx);
             }))
             .size_full()
             .relative()
@@ -1533,7 +1733,7 @@ impl GbWindow {
         title: String,
         tip: String,
         trailing: impl IntoElement,
-    ) -> impl IntoElement {
+    ) -> gpui::Div {
         let theme = theme::current();
         div()
             .flex_none()
@@ -1570,13 +1770,22 @@ impl GbWindow {
 
     fn uncommitted_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = theme::current();
-        let header = self.column_header(
-            "uncommitted-title",
-            self.store.pane == Pane::Uncommitted,
-            "Uncommitted changes".to_string(),
-            "Uncommitted changes".to_string(),
-            self.view_toggle(cx),
-        );
+        let trailing = self.view_toggle(cx);
+        let header = self
+            .column_header(
+                "uncommitted-title",
+                self.store.pane == Pane::Uncommitted,
+                "Uncommitted changes".to_string(),
+                "Uncommitted changes. Drop a file or hunk here to clear its lane.".to_string(),
+                trailing,
+            )
+            .on_drop(cx.listener(|this, item: &DropItem, _, cx| {
+                let result = this.store.drop_on_lane(item, None);
+                this.finish_drop(result, cx);
+            }))
+            .drag_over(drop_highlight)
+            .can_drop(accepts_unassign)
+            .into_any_element();
         let pending = self
             .store
             .activity
@@ -1698,7 +1907,7 @@ impl GbWindow {
     ) -> impl IntoElement {
         let theme = theme::current();
         let name = group.name.clone();
-        let tip = format!("Actions for {name}");
+        let tip = format!("Drag {name} onto a lane. Right-click for more actions.");
         div()
             .id(SharedString::from(format!("group-{name}")))
             .w_full()
@@ -1709,6 +1918,7 @@ impl GbWindow {
             .items_center()
             .gap_2()
             .tooltip(Tooltip::text(tip))
+            .on_drag(self.store.paths_drag(paths.as_ref()), drag_preview)
             .on_mouse_down(MouseButton::Right, {
                 let paths = Arc::clone(&paths);
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1874,8 +2084,11 @@ impl GbWindow {
         let focused = self.store.pane == Pane::Uncommitted && selected;
         let path = file.path.clone();
         let label = label.to_string();
-        let tip = format!("{path}. {label}. Ctrl-click marks it. Shift-click marks a range.");
+        let tip = format!(
+            "{path}. {label}. Click opens it. Ctrl-click toggles it. Shift-click selects the range. Drag it onto a lane."
+        );
         let marked = self.store.file_marked(&path);
+        let chosen = selected || marked;
         div()
             .id(SharedString::from(format!("file-{path}")))
             .w_full()
@@ -1892,11 +2105,10 @@ impl GbWindow {
             } else {
                 gpui::Hsla::from(theme.editor)
             })
-            .when(selected, |row| row.bg(theme.selected))
-            .when(!selected, |row| {
-                row.hover(move |style| style.bg(theme.hover))
-            })
+            .when(chosen, |row| row.bg(theme.selected))
+            .when(!chosen, |row| row.hover(move |style| style.bg(theme.hover)))
             .tooltip(Tooltip::text(tip))
+            .on_drag(self.store.file_drag(&path), drag_preview)
             .on_mouse_down(MouseButton::Right, {
                 let path = path.clone();
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1928,22 +2140,14 @@ impl GbWindow {
                         cx.notify();
                         return;
                     }
+                    this.store.arm_mark(&path);
                     let effect = this.store.open_current();
                     this.activate(effect, cx);
                     cx.notify();
                 })
             })
             .child(status_mark(file.status))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .font_family(ns_ui::CODE_FONT)
-                    .text_xs()
-                    .when(marked, |row| row.text_color(gpui::Hsla::from(theme.accent)))
-                    .truncate()
-                    .child(file.path.clone()),
-            )
+            .child(file_title(&file.path, marked))
             .child(counts(file.additions, file.deletions))
             .child(self.assignment_dot(format!("assign-list-{path}"), &label))
             .when_some(self.store.activity.row_label(&path), |row, tip| {
@@ -1983,12 +2187,17 @@ impl GbWindow {
         } else {
             (theme.accent, format!("Assigned to {label}"))
         };
+        // 12px is 75% of the old 16px disk. The resting border matches the fill
+        // so the disk stays 12px; hover turns that ring white.
         div()
             .id(SharedString::from(id))
             .flex_none()
-            .size(px(16.))
+            .size(px(12.))
             .rounded_full()
             .bg(color)
+            .border_1()
+            .border_color(color)
+            .hover(|style| style.border_color(gpui::rgb(0xffffff)))
             .tooltip(Tooltip::text(tip))
     }
 
@@ -2020,6 +2229,7 @@ impl GbWindow {
         let deletions = row.deletions;
         let depth = row.depth;
         let action = if row.expanded { "Collapse" } else { "Expand" };
+        let drag_paths = self.paths_in_folder(&path);
         div()
             .id(SharedString::from(format!("tree-{index}")))
             .w_full()
@@ -2042,8 +2252,9 @@ impl GbWindow {
                 line.hover(move |style| style.bg(theme.hover))
             })
             .tooltip(Tooltip::text(format!(
-                "{path}. {count} files. Click the arrow to {action}."
+                "{path}. {count} files. Click the arrow to {action}. Drag onto a lane to assign these files."
             )))
+            .on_drag(self.store.paths_drag(&drag_paths), drag_preview)
             .on_mouse_down(MouseButton::Right, {
                 let path = path.clone();
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2160,8 +2371,11 @@ impl GbWindow {
             .store
             .lane_label(file_index)
             .unwrap_or_else(|| "Unassigned".to_string());
-        let tip = format!("{path}. {label}. Ctrl-click marks it. Shift-click marks a range.");
+        let tip = format!(
+            "{path}. {label}. Click opens it. Ctrl-click toggles it. Shift-click selects the range. Drag it onto a lane."
+        );
         let marked = self.store.file_marked(&path);
+        let chosen = selected || marked;
         div()
             .id(SharedString::from(format!("tree-{index}")))
             .w_full()
@@ -2179,11 +2393,12 @@ impl GbWindow {
             } else {
                 gpui::Hsla::from(theme.editor)
             })
-            .when(selected, |line| line.bg(theme.selected))
-            .when(!selected, |line| {
+            .when(chosen, |line| line.bg(theme.selected))
+            .when(!chosen, |line| {
                 line.hover(move |style| style.bg(theme.hover))
             })
             .tooltip(Tooltip::text(tip))
+            .on_drag(self.store.file_drag(&path), drag_preview)
             .on_mouse_down(MouseButton::Right, {
                 let path = path.clone();
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2215,6 +2430,7 @@ impl GbWindow {
                         cx.notify();
                         return;
                     }
+                    this.store.arm_mark(&path);
                     let effect = this.store.open_current();
                     this.activate(effect, cx);
                     cx.notify();
@@ -2311,14 +2527,21 @@ impl GbWindow {
     /// The bottom diff pane shows the open file while a commit or branch is
     /// focused; a diff of another commit is stale and stays hidden.
     fn diff_pane_open(&self) -> bool {
-        match (&self.store.side, &self.store.shown) {
-            (SideFocus::Commit { sha }, ShownFile::Commit { sha: shown_sha, .. }) => {
-                sha == shown_sha
+        match &self.store.shown {
+            ShownFile::Commit { sha: shown_sha, .. } => {
+                matches!(&self.store.side, SideFocus::Commit { sha } if sha == shown_sha)
             }
-            (SideFocus::Commit { .. } | SideFocus::Branch { .. }, ShownFile::Worktree { .. }) => {
-                true
+            ShownFile::Branch { name, .. } => self
+                .store
+                .branch_info()
+                .is_some_and(|info| info.name == *name),
+            ShownFile::Worktree { .. } => {
+                matches!(
+                    self.store.side,
+                    SideFocus::Commit { .. } | SideFocus::Branch { .. }
+                )
             }
-            _ => false,
+            ShownFile::None => false,
         }
     }
 
@@ -2479,10 +2702,19 @@ impl GbWindow {
         if self.shaped_for.get() != ptr {
             self.shaped.borrow_mut().clear();
             self.shaped_for.set(ptr);
+            *self.diff_pick.borrow_mut() = DiffPick::idle();
         }
         let shaped = Rc::clone(&self.shaped);
         let painted = Rc::clone(&self.painted);
         let entity = cx.entity();
+        // uniform_list measures one row for its content width. Point it at the
+        // widest line so horizontal scroll reaches the end of long diff lines.
+        let widest = rows
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, row)| row.text.chars().count())
+            .map(|(index, _)| index)
+            .unwrap_or(0);
         div()
             .relative()
             .flex_1()
@@ -2522,18 +2754,24 @@ impl GbWindow {
                                 }
                                 _ => None,
                             };
+                            let span =
+                                diff_span(&this.diff_pick.borrow(), index, row.text.as_str());
                             out.push(paint_diff_row(
                                 row,
                                 index,
                                 focused && cursor == index,
                                 chrome,
                                 text,
+                                span,
+                                entity.clone(),
                             ));
                         }
                         out
                     })
                 })
                 .track_scroll(&self.diff_scroll)
+                .with_width_from_item(Some(widest))
+                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
                 .flex_1()
                 .size_full(),
             )
@@ -2555,6 +2793,11 @@ impl GbWindow {
                 &self.diff_scroll.0.borrow().base_handle,
                 Axis::Vertical,
             ))
+            .child(Scrollbar::new(
+                "diff-scrollbar-x",
+                &self.diff_scroll.0.borrow().base_handle,
+                Axis::Horizontal,
+            ))
             .into_any_element()
     }
 
@@ -2563,12 +2806,13 @@ impl GbWindow {
     }
 
     fn branches_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let trailing = self.upstream_chip(cx);
         let header = self.column_header(
             "branches-title",
             self.store.pane == Pane::Branches,
             "Branches".to_string(),
             "Branches".to_string(),
-            self.upstream_chip(cx),
+            trailing,
         );
         div()
             .size_full()
@@ -2825,12 +3069,17 @@ impl GbWindow {
         let short_tip: String = tip.chars().take(7).collect();
         let chevron_tip = format!("{action} {name}");
         let row_tip = if tip.is_empty() {
-            format!("Focus branch {name}")
+            format!(
+                "Focus branch {name}. Drop on the top half to stack a branch above it. The bottom half places it under this branch. Drop a file or hunk to assign it."
+            )
         } else {
-            format!("Focus branch {name}. Tip {tip}.")
+            format!(
+                "Focus branch {name}. Tip {tip}. Drop on the top half to stack a branch above it. The bottom half places it under this branch. Drop a file or hunk to assign it."
+            )
         };
         div()
             .id(SharedString::from(format!("branch-{index}")))
+            .relative()
             .px_2()
             .min_h(px(28.))
             .flex()
@@ -2843,6 +3092,7 @@ impl GbWindow {
                 row.hover(move |style| style.bg(theme.hover))
             })
             .tooltip(Tooltip::text(row_tip))
+            .on_drag(DropItem::Branch(name.clone()), drag_preview)
             .on_mouse_down(MouseButton::Right, {
                 let name = name.clone();
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2857,6 +3107,7 @@ impl GbWindow {
                 })
             })
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.store.pane = Pane::Branches;
                 this.store.set_cursor(Pane::Branches, index);
                 let effect = this.store.open_current();
                 this.activate(effect, cx);
@@ -2922,6 +3173,30 @@ impl GbWindow {
                     }
                 }),
             ))
+            .when(cx.has_active_drag(), |row| {
+                // The header always stacks a branch above it. The bottom half
+                // stacks below only when the branch has no visible commits;
+                // otherwise the below-stack cue sits on the last commit, and the
+                // bottom half here only assigns.
+                let below_seat = if self.store.branch_below_anchor(index).as_deref() == Some(&name)
+                {
+                    DropSeat::BranchStack(name.clone())
+                } else {
+                    DropSeat::BranchAssign(name.clone())
+                };
+                row.child(self.drop_half(
+                    SharedString::from(format!("branch-above-{index}")),
+                    false,
+                    DropSeat::BranchStack(name.clone()),
+                    cx,
+                ))
+                .child(self.drop_half(
+                    SharedString::from(format!("branch-below-{index}")),
+                    true,
+                    below_seat,
+                    cx,
+                ))
+            })
     }
 
     fn open_lane_menu_at(&mut self, name: &str, x: f32, y: f32, cx: &mut Context<Self>) {
@@ -3079,6 +3354,7 @@ impl GbWindow {
         let pushed = commit.pushed;
         div()
             .id(SharedString::from(format!("commit-{index}")))
+            .relative()
             .px_2()
             .py_1()
             .flex()
@@ -3090,7 +3366,10 @@ impl GbWindow {
             .when(!selected, |row| {
                 row.hover(move |style| style.bg(theme.hover))
             })
-            .tooltip(Tooltip::text(format!("Focus commit {sha}. {title}.")))
+            .tooltip(Tooltip::text(format!(
+                "Focus commit {sha}. {title}. Drop a commit on the top half to place it above, or the bottom half to place it below. Drop a branch on the top half to stack it above this branch. Drop a file or hunk to assign it."
+            )))
+            .on_drag(DropItem::Commit(sha.clone()), drag_preview)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.store.set_cursor(Pane::Branches, index);
                 let effect = this.store.open_current();
@@ -3183,6 +3462,34 @@ impl GbWindow {
                         ))
                     }),
             )
+            .when(cx.has_active_drag(), |row| {
+                let seat = DropSeat::Commit(sha.clone());
+                let row = row
+                    .child(self.drop_half(
+                        SharedString::from(format!("commit-above-{index}")),
+                        false,
+                        seat.clone(),
+                        cx,
+                    ))
+                    .child(self.drop_half(
+                        SharedString::from(format!("commit-below-{index}")),
+                        true,
+                        seat,
+                        cx,
+                    ));
+                // When this is the branch's last commit, dropping a branch on the
+                // bottom half stacks it below the whole branch. The insertion line
+                // then sits after the last commit, where the branch will land.
+                match self.store.branch_below_anchor(index) {
+                    Some(branch) => row.child(self.drop_half(
+                        SharedString::from(format!("commit-branch-below-{index}")),
+                        true,
+                        DropSeat::BranchStack(branch),
+                        cx,
+                    )),
+                    None => row,
+                }
+            })
     }
 
     fn detail_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3491,15 +3798,10 @@ impl GbWindow {
             Some(info.authors.join(", "))
         };
         let dates = date_range(info.earliest, info.latest);
-        // The commit list is virtualized: only visible rows are built, so a
-        // 3,000-commit lane costs a viewport of element trees, not all of them.
-        let commits = Arc::clone(&info.commits);
-        let count = commits.len();
-        let has_commits = count > 0;
-        let entity = cx.entity();
-        let painted = Rc::clone(&self.painted);
         div()
             .w_full()
+            .flex_1()
+            .min_h(px(0.))
             .px_3()
             .py_2()
             .flex()
@@ -3548,43 +3850,163 @@ impl GbWindow {
                     )
                     .child(copy_button("copy-sha", full, cx)),
             )
+            .child(self.branch_files_section(&info.name, cx))
+    }
+
+    /// Every file the focused branch changes, under the branch meta.
+    fn branch_files_section(&self, name: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = theme::current();
+        let ready = self.store.branch_changes_for.as_deref() == Some(name)
+            && self.store.branch_changes.is_some();
+        let error = (!ready)
+            .then(|| self.store.branch_files_error.clone())
+            .flatten();
+        let label = div()
+            .id("branch-files-label")
+            .pt_1()
+            .flex_none()
+            .text_xs()
+            .text_color(theme.muted)
+            .tooltip(Tooltip::text(
+                "Every file this branch changes, compared with its base.",
+            ))
+            .child("Changed files");
+        if self.store.activity.spinner_on("branch_files") && !ready {
+            return div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(label)
+                .child(ui::loading_pane(
+                    "branch-files-loading",
+                    "Reading the branch",
+                    &theme,
+                ))
+                .into_any_element();
+        }
+        if self.store.activity.is_loading("branch_files") && !ready {
+            return div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(label)
+                .child(quiet_body())
+                .into_any_element();
+        }
+        if let Some(message) = error.as_deref() {
+            return div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(label)
+                .child(self.error_note("branch-files-error", message, "branch_files", cx))
+                .into_any_element();
+        }
+        let Some(files) = self.store.branch_changes.clone().filter(|_| ready) else {
+            return div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(label)
+                .child(wrapped_note("Reading the branch."))
+                .into_any_element();
+        };
+        if files.is_empty() {
+            return div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(label)
+                .child(wrapped_note("No changed files on this branch."))
+                .into_any_element();
+        }
+        let count = files.len();
+        let entity = cx.entity();
+        let painted = Rc::clone(&self.painted);
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(label)
             .child(
-                div()
-                    .pt_1()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child("Commits"),
-            )
-            .when(info.commits.is_empty(), |column| {
-                column.child(wrapped_note("No commits on this branch yet."))
-            })
-            .when(has_commits, |column| {
-                column.child(
-                    uniform_list("branch-detail-rows", count, move |range, _, cx| {
-                        let commits = Arc::clone(&commits);
-                        painted.set(painted.get().saturating_add(range.len() as u64));
-                        entity.update(cx, |this, cx| {
-                            let mut out = Vec::new();
-                            for index in range {
-                                let Some(commit) = commits.get(index) else {
-                                    continue;
-                                };
-                                // The gap_1 spacing the old flex column gave rows.
-                                out.push(
-                                    div()
-                                        .pb(px(4.))
-                                        .child(this.branch_commit_row(index, commit, cx)),
-                                );
-                            }
-                            out
-                        })
+                uniform_list("branch-file-rows", count, move |range, _, cx| {
+                    let files = Arc::clone(&files);
+                    painted.set(painted.get().saturating_add(range.len() as u64));
+                    entity.update(cx, |this, cx| {
+                        let mut out = Vec::new();
+                        for index in range {
+                            let Some(file) = files.get(index) else {
+                                continue;
+                            };
+                            out.push(
+                                div()
+                                    .pb(px(4.))
+                                    .child(this.branch_file_row(index, file, cx)),
+                            );
+                        }
+                        out
                     })
-                    .track_scroll(&self.detail_scroll)
-                    .flex_1()
-                    .min_h(px(0.)),
-                )
+                })
+                .track_scroll(&self.detail_scroll)
+                .flex_1()
+                .min_h(px(0.)),
+            )
+            .into_any_element()
+    }
+
+    fn branch_file_row(
+        &self,
+        index: usize,
+        file: &CommitFile,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme::current();
+        let selected = self.store.cursor(Pane::Detail) == index
+            && matches!(self.store.side, SideFocus::Branch { .. });
+        let focused = self.store.pane == Pane::Detail && selected;
+        let path = file.path.clone();
+        div()
+            .id(SharedString::from(format!("branch-file-{index}")))
+            .px_2()
+            .min_h(px(30.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .overflow_hidden()
+            .cursor_pointer()
+            .border_l_2()
+            .border_color(if focused {
+                gpui::Hsla::from(theme.accent)
+            } else {
+                gpui::Hsla::from(theme.editor)
             })
+            .when(selected, |row| row.bg(theme.selected))
+            .when(!selected, |row| {
+                row.hover(move |style| style.bg(theme.hover))
+            })
+            .tooltip(Tooltip::text(format!("Show the diff for {path}")))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.store.pane = Pane::Detail;
+                this.store.set_cursor(Pane::Detail, index);
+                let effect = this.store.open_current();
+                this.activate(effect, cx);
+                cx.notify();
+            }))
+            .child(status_mark(file.status))
+            .child(file_title(&path, false))
+            .child(counts(file.additions, file.deletions))
     }
 
     fn push_chip(&self, state: &str) -> impl IntoElement {
@@ -3604,62 +4026,6 @@ impl GbWindow {
             .self_start()
             .tooltip(Tooltip::text(tip))
             .child(ns_ui::chip(state.to_string(), tone))
-    }
-
-    fn branch_commit_row(
-        &self,
-        index: usize,
-        commit: &store::CommitLine,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = theme::current();
-        let selected = self.store.cursor(Pane::Detail) == index
-            && matches!(self.store.side, SideFocus::Branch { .. });
-        let focused = self.store.pane == Pane::Detail && selected;
-        let short = commit.short_sha.clone();
-        let title = commit.title.clone();
-        div()
-            .id(SharedString::from(format!("detail-commit-{index}")))
-            .px_2()
-            .min_h(px(30.))
-            .flex()
-            .items_center()
-            .gap_2()
-            .overflow_hidden()
-            .cursor_pointer()
-            .border_l_2()
-            .border_color(if focused {
-                gpui::Hsla::from(theme.accent)
-            } else {
-                gpui::Hsla::from(theme.editor)
-            })
-            .when(selected, |row| row.bg(theme.selected))
-            .when(!selected, |row| {
-                row.hover(move |style| style.bg(theme.hover))
-            })
-            .tooltip(Tooltip::text(format!("Focus commit {short}: {title}")))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.store.set_cursor(Pane::Detail, index);
-                let effect = this.store.open_current();
-                this.activate(effect, cx);
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .flex_none()
-                    .font_family(ns_ui::CODE_FONT)
-                    .text_xs()
-                    .text_color(theme.accent)
-                    .child(short),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .text_sm()
-                    .truncate()
-                    .child(title),
-            )
     }
 
     fn menu_catcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5700,6 +6066,8 @@ impl GbWindow {
         let loading = self.store.pages.branches_loading;
         let error = self.store.pages.branches_error.clone();
         let mut list: Vec<gpui::AnyElement> = Vec::new();
+        // True when real branch rows render, so the body virtualizes them.
+        let mut show_rows = false;
         if tab != BranchTab::PullRequests {
             if self
                 .store
@@ -5732,9 +6100,7 @@ impl GbWindow {
                         .into_any_element(),
                 );
             } else {
-                for (index, row) in rows.iter().enumerate() {
-                    list.push(self.branch_page_row(index, row, index == cursor, cx));
-                }
+                show_rows = true;
             }
         }
         let filter_placeholder = if tab == BranchTab::PullRequests {
@@ -5742,16 +6108,25 @@ impl GbWindow {
         } else {
             "Filter by name, commit, or author"
         };
-        let filter_tip = if tab == BranchTab::PullRequests {
-            "Filter pull requests by number, title, branch, or check state. Backspace deletes."
-        } else {
-            "Filter branches by name, last commit, or author. Backspace deletes."
-        };
-        let filter_shown = if filter.is_empty() {
-            filter_placeholder.to_string()
-        } else {
-            format!("{filter}▌")
-        };
+        // Keep the native input's placeholder in step with the active tab.
+        if self
+            .branch_filter_input
+            .read(cx)
+            .placeholder_text()
+            .as_ref()
+            != filter_placeholder
+        {
+            self.branch_filter_input.update(cx, |input, cx| {
+                input.set_placeholder(filter_placeholder, cx);
+            });
+        }
+        // Keep the input's text in step with the filter when the input is not
+        // the one driving it (a reset, or keyboard filtering without focus).
+        if !self.store.pages.filter_focused && self.branch_filter_input.read(cx).text() != filter {
+            self.branch_filter_input.update(cx, |input, cx| {
+                input.set_text(filter.clone(), cx);
+            });
+        }
         div()
             .id("branches-page")
             .size_full()
@@ -5777,33 +6152,58 @@ impl GbWindow {
                     .child(div().flex_1()),
             )
             .child(
-                div()
-                    .id("branch-filter")
-                    .flex_none()
-                    .h(px(32.))
-                    .mx_3()
-                    .mt_2()
-                    .px_2()
-                    .border_b_1()
-                    .border_color(gpui::Hsla::from(theme.border))
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .font_family(ns_ui::CODE_FONT)
-                    .text_xs()
-                    .text_color(if filter.is_empty() {
-                        theme.muted
-                    } else {
-                        theme.text
-                    })
-                    .tooltip(Tooltip::text(filter_tip))
-                    .child(filter_shown),
+                div().id("branch-filter").flex_none().mx_3().mt_2().child(
+                    Input::new(&self.branch_filter_input)
+                        .size(ControlSize::Sm)
+                        .clearable()
+                        .prefix(
+                            Icon::new(IconName::Search)
+                                .size(IconSize::Sm)
+                                .color(gpui::Hsla::from(theme.muted)),
+                        ),
+                ),
             )
             .child(notice_line("branch-notice", &notice, notice_bad))
             .child(if tab == BranchTab::PullRequests {
                 self.pr_review_rows(&filter, cx)
             } else if virtual_branches {
                 self.virtual_branch_rows(cursor, cx)
+            } else if show_rows {
+                let rows = Arc::clone(&rows);
+                let count = rows.len();
+                let entity = cx.entity();
+                let painted = Rc::clone(&self.painted);
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        uniform_list("branches-page-rows", count, move |range, _, cx| {
+                            let rows = Arc::clone(&rows);
+                            painted.set(painted.get().saturating_add(range.len() as u64));
+                            entity.update(cx, |this, cx| {
+                                let mut out = Vec::new();
+                                for index in range {
+                                    let Some(row) = rows.get(index) else {
+                                        continue;
+                                    };
+                                    out.push(this.branch_page_row(index, row, index == cursor, cx));
+                                }
+                                out
+                            })
+                        })
+                        .track_scroll(&self.branch_list_scroll)
+                        .flex_1()
+                        .size_full(),
+                    )
+                    .child(Scrollbar::new(
+                        "branches-page-scrollbar",
+                        &self.branch_list_scroll.0.borrow().base_handle,
+                        Axis::Vertical,
+                    ))
+                    .into_any_element()
             } else {
                 if self.perf_full {
                     self.painted
@@ -6031,7 +6431,7 @@ impl GbWindow {
         div()
             .id(SharedString::from(format!("branch-row-{index}")))
             .w_full()
-            .min_h(px(56.))
+            .h(px(56.))
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -6236,6 +6636,7 @@ impl GbWindow {
             })
         })
         .track_scroll(&self.history_list_scroll)
+        .w_full()
         .flex_1()
         .min_h(px(0.))
         .into_any_element()
@@ -6250,33 +6651,36 @@ impl GbWindow {
     ) -> gpui::AnyElement {
         let theme = theme::current();
         let title = snapshot.title.clone();
-        let when = snapshot_when(snapshot.created_at_ms);
+        let when_label = snapshot_when(snapshot.created_at_ms);
         let kind = snapshot_kind(&snapshot.operation);
         let sha = snapshot.sha.clone();
+        let tip = format!("{title}. {when_label}. {kind}.");
         div()
             .id(SharedString::from(format!("snapshot-{index}")))
+            .w_full()
             .min_h(px(40.))
-            .px_2()
+            .px_3()
             .py_1()
             .flex()
             .flex_col()
             .justify_center()
-            .gap(px(1.))
+            .gap_1()
             .overflow_hidden()
             .cursor_pointer()
             .border_l_2()
             .border_color(if marked {
                 gpui::Hsla::from(theme.accent)
             } else {
-                gpui::Hsla::from(theme.editor)
+                gpui::Hsla::from(theme.background)
             })
             .when(marked, |row| row.bg(theme.selected))
             .when(!marked, |row| row.hover(move |style| style.bg(theme.hover)))
-            .tooltip(Tooltip::text(format!("{title}. {when}. {kind}.")))
+            .tooltip(Tooltip::text(tip))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 let effect = this.store.select_snapshot_id(&sha);
                 this.finish_page_request(effect, cx);
             }))
+            .child(div().min_w(px(0.)).text_sm().truncate().child(title))
             .child(
                 div()
                     .flex()
@@ -6285,21 +6689,22 @@ impl GbWindow {
                     .overflow_hidden()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_sm()
-                            .truncate()
-                            .child(title),
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child(when_label),
                     )
                     .child(
                         div()
                             .id(SharedString::from(format!("snapshot-kind-{index}")))
-                            .flex_none()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted)
                             .tooltip(Tooltip::text(format!("Kind: {kind}")))
-                            .child(ns_ui::chip(kind.to_string(), Tone::Neutral)),
+                            .child(kind.to_string()),
                     ),
             )
-            .child(div().text_xs().text_color(theme.muted).child(when))
             .into_any_element()
     }
 
@@ -6313,10 +6718,10 @@ impl GbWindow {
         let focused = self.store.pages.message_focused;
         let notice = self.store.pages.history_notice.clone().unwrap_or_default();
         let notice_bad = self.store.pages.history_notice_bad;
-        let files = Arc::clone(&self.store.pages.snapshot_files);
-        let diff_loading = self.store.pages.diff_loading;
-        let selected = self.store.pages.selected_snapshot().cloned();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        // The split is the ledger plus one snapshot. Loading, empty and error
+        // fill the page instead, because there is no snapshot to put on the right.
+        let mut browsing = false;
         if self
             .store
             .activity
@@ -6331,6 +6736,7 @@ impl GbWindow {
         } else if self.store.pages.history_loading && snapshots.is_empty() {
             rows.push(quiet_body());
         } else if virtual_history {
+            browsing = true;
         } else if snapshots.is_empty() {
             if let Some(message) = &self.store.pages.history_error {
                 rows.push(self.error_note("history-error", message, "list_snapshots", cx));
@@ -6338,9 +6744,9 @@ impl GbWindow {
                 rows.push(
                     div()
                         .id("history-empty")
-                        .px_2()
-                        .py_2()
-                        .text_xs()
+                        .px_3()
+                        .py_3()
+                        .text_sm()
                         .text_color(theme.muted)
                         .tooltip(Tooltip::text(
                             "No snapshots yet. Type a sentence above, then choose Create snapshot.",
@@ -6352,69 +6758,9 @@ impl GbWindow {
                 );
             }
         } else {
+            browsing = true;
             for (index, snapshot) in snapshots.iter().enumerate() {
                 rows.push(self.snapshot_row(index, snapshot, index == cursor, cx));
-            }
-        }
-        let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
-        if diff_loading {
-            file_rows.push(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child("Reading changed files")
-                    .into_any_element(),
-            );
-        } else if selected.is_none() {
-            file_rows.push(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child("Select a snapshot to see its changed files.")
-                    .into_any_element(),
-            );
-        } else if files.is_empty() {
-            file_rows.push(
-                div()
-                    .id("snapshot-files-empty")
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child("No file changes in this snapshot.")
-                    .into_any_element(),
-            );
-        } else {
-            // The 88-point pane shows about four 22-point rows; the fixed
-            // pane never scrolls, so the visible window is all it can paint.
-            let window = store::visible_window(
-                files.len(),
-                0.0,
-                SNAPSHOT_FILES_PX,
-                SNAPSHOT_FILE_PITCH_PX,
-                0,
-            );
-            let window_start = window.start;
-            for (offset, change) in files[window].iter().enumerate() {
-                let index = window_start + offset;
-                let path = change.path.clone();
-                let status = change.status;
-                file_rows.push(
-                    div()
-                        .id(SharedString::from(format!("snapshot-file-{index}")))
-                        .h(px(22.))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .overflow_hidden()
-                        .font_family(ns_ui::CODE_FONT)
-                        .text_xs()
-                        .tooltip(Tooltip::text(format!(
-                            "{} {path}",
-                            store::file_change_label(status)
-                        )))
-                        .child(status_mark(status))
-                        .child(div().min_w(px(0.)).truncate().child(path))
-                        .into_any_element(),
-                );
             }
         }
         let draft = if message.is_empty() && !focused {
@@ -6424,6 +6770,148 @@ impl GbWindow {
         } else {
             message.clone()
         };
+        let placeholder = message.is_empty() && !focused;
+        div()
+            .id("history-panel")
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(theme.background)
+            .child(self.snapshot_compose(draft, placeholder, focused, cx))
+            .child(notice_line("history-notice", &notice, notice_bad))
+            .child(if browsing {
+                self.history_split(virtual_history, cursor, rows, cx)
+            } else {
+                div()
+                    .id("history-hint")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .tooltip(Tooltip::text(
+                        "Escape returns to the workspace. b opens Branches.",
+                    ))
+                    .children(rows)
+                    .into_any_element()
+            })
+    }
+
+    /// Message field and Create snapshot. Both are 40px, so the field matches
+    /// the button beside it. Focus is a mint ring, not a border that changes width.
+    fn snapshot_compose(
+        &self,
+        draft: String,
+        placeholder: bool,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = theme::current();
+        div()
+            .flex_none()
+            .h(px(48.))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.panel)
+            .child(
+                div()
+                    .id("snapshot-message")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h(px(40.))
+                    .px_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(gpui::Hsla::from(theme.border))
+                    .when(focused, |field| {
+                        field.shadow(vec![
+                            gpui::BoxShadow::new(px(0.), px(0.), gpui::Hsla::from(theme.accent))
+                                .spread_radius(px(2.))
+                                .inset(),
+                        ])
+                    })
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .font_family(ns_ui::CODE_FONT)
+                    .text_xs()
+                    .text_color(if placeholder { theme.muted } else { theme.text })
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(
+                        "Message for the new snapshot. Enter records it. Escape leaves the field.",
+                    ))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.store.pages.message_focused = true;
+                        cx.notify();
+                    }))
+                    .child(div().min_w(px(0.)).truncate().child(draft)),
+            )
+            .child(self.snapshot_create_button(cx))
+            .into_any_element()
+    }
+
+    /// Ledger on the left, the snapshot you would restore on the right.
+    fn history_split(
+        &self,
+        virtual_history: bool,
+        cursor: usize,
+        rows: Vec<gpui::AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = theme::current();
+        let ledger = if virtual_history {
+            drop(rows);
+            self.virtual_snapshots(cursor, cx)
+        } else {
+            if self.perf_full {
+                self.painted
+                    .set(self.painted.get().saturating_add(rows.len() as u64));
+            }
+            ScrollArea::new("history-scroll")
+                .vertical()
+                .track_scroll(&self.history_scroll)
+                .flex_1()
+                .min_h(px(0.))
+                .child(div().w_full().flex().flex_col().children(rows))
+                .into_any_element()
+        };
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("history-hint")
+                    .h_full()
+                    .flex_1()
+                    .flex_grow(2.)
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .tooltip(Tooltip::text(
+                        "Escape returns to the workspace. b opens Branches.",
+                    ))
+                    .child(ledger),
+            )
+            .child(div().w(px(1.)).h_full().flex_none().bg(theme.border))
+            .child(self.snapshot_detail(cx))
+            .into_any_element()
+    }
+
+    fn snapshot_detail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = theme::current();
+        let selected = self.store.pages.selected_snapshot().cloned();
+        let sha = selected.as_ref().map(|snapshot| snapshot.sha.clone());
+        self.sync_file_scroll(sha.as_deref());
+        let files = Arc::clone(&self.store.pages.snapshot_files);
+        let diff_loading = self.store.pages.diff_loading;
         let can_restore = selected
             .as_ref()
             .is_some_and(|snapshot| snapshot.restorable)
@@ -6442,167 +6930,215 @@ impl GbWindow {
             "Put the project back to the selected snapshot. This asks before it writes.".to_string()
         };
         div()
-            .id("history-panel")
-            .size_full()
+            .flex_1()
+            .flex_grow(3.)
+            .min_w(px(0.))
+            .h_full()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(theme.background)
-            .child(
-                div()
-                    .h(px(40.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(theme.panel)
-                    .child(div().text_sm().child("History"))
-                    .child(
-                        div()
-                            .id("history-hint")
-                            .text_xs()
-                            .text_color(theme.muted)
-                            .tooltip(Tooltip::text(
-                                "Escape returns to the workspace. b opens Branches.",
-                            ))
-                            .child("Escape returns to the workspace"),
-                    ),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id("snapshot-message")
-                            .flex_1()
-                            .min_w(px(0.))
-                            .h(px(28.))
-                            .px_1()
-                            .border_b_1()
-                            .border_color(if focused {
-                                gpui::Hsla::from(theme.accent)
-                            } else {
-                                gpui::Hsla::from(theme.border)
-                            })
-                            .flex()
-                            .items_center()
-                            .overflow_hidden()
-                            .font_family(ns_ui::CODE_FONT)
-                            .text_xs()
-                            .text_color(if message.is_empty() && !focused {
-                                theme.muted
-                            } else {
-                                theme.text
-                            })
-                            .cursor_pointer()
-                            .tooltip(Tooltip::text(
-                                "Message for the new snapshot. Enter records it. Escape leaves the field.",
-                            ))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.store.pages.message_focused = true;
-                                cx.notify();
-                            }))
-                            .child(div().min_w(px(0.)).truncate().child(draft)),
-                    )
-                    .child(self.snapshot_create_button(cx)),
-            )
-            .child(notice_line("history-notice", &notice, notice_bad))
-            .child(if virtual_history {
-                self.virtual_snapshots(cursor, cx)
-            } else {
-                if self.perf_full {
-                    self.painted
-                        .set(self.painted.get().saturating_add(rows.len() as u64));
-                }
-                ScrollArea::new("history-scroll")
-                    .vertical()
-                    .track_scroll(&self.history_scroll)
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(div().w_full().flex().flex_col().children(rows))
-                    .into_any_element()
-            })
+            .bg(theme.editor)
+            .child(self.snapshot_heading(selected.as_ref()))
             .child(
                 div()
                     .flex_none()
-                    .h(px(22.))
-                    .px_2()
+                    .h(px(32.))
+                    .px_3()
                     .flex()
                     .items_center()
                     .text_xs()
                     .text_color(theme.muted)
                     .child("Changed files"),
             )
+            .child(self.snapshot_files(selected.is_some(), diff_loading, files))
             .child(
                 div()
                     .flex_none()
-                    .h(px(88.))
-                    .px_2()
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .children(file_rows),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(36.))
-                    .px_2()
+                    .h(px(48.))
+                    .px_3()
                     .flex()
                     .items_center()
                     .border_t_1()
                     .border_color(theme.border)
-                    .child(if can_restore {
-                        word_button(
-                            SharedString::from("restore-snapshot"),
-                            "Restore to here",
-                            restore_tip,
-                            true,
-                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                if let Err(error) = this.store.ask_restore() {
-                                    this.store.toast_bad = true;
-                                    this.store.toast = Some(error);
-                                }
-                                cx.notify();
-                            }),
-                        )
-                    } else {
-                        inert_word(
-                            SharedString::from("restore-snapshot"),
-                            "Restore to here",
-                            restore_tip,
-                        )
-                    }),
+                    .child(self.restore_control(can_restore, restore_tip, cx)),
             )
+            .into_any_element()
+    }
+
+    fn sync_file_scroll(&self, sha: Option<&str>) {
+        let mut shown = self.snapshot_file_for.borrow_mut();
+        if shown.as_deref() == sha {
+            return;
+        }
+        *shown = sha.map(str::to_string);
+        self.snapshot_file_scroll
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
+    }
+
+    fn snapshot_heading(&self, snapshot: Option<&gb_bridge::SnapshotInfo>) -> gpui::AnyElement {
+        let theme = theme::current();
+        let Some(snapshot) = snapshot else {
+            return div().into_any_element();
+        };
+        let when_label = snapshot_when(snapshot.created_at_ms);
+        let kind = snapshot_kind(&snapshot.operation);
+        div()
+            .flex_none()
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .child(ui::rail(&theme, true))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_sm()
+                            .child(snapshot.title.clone()),
+                    ),
+            )
+            .child(div().text_xs().text_color(theme.muted).child(when_label))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child(kind.to_string()),
+            )
+            .into_any_element()
+    }
+
+    fn snapshot_files(
+        &self,
+        selected: bool,
+        diff_loading: bool,
+        files: Arc<Vec<gb_bridge::SnapshotChange>>,
+    ) -> gpui::AnyElement {
+        let theme = theme::current();
+        if diff_loading {
+            return div()
+                .flex_1()
+                .px_3()
+                .py_2()
+                .text_xs()
+                .text_color(theme.muted)
+                .child("Reading changed files")
+                .into_any_element();
+        }
+        if !selected {
+            return div()
+                .flex_1()
+                .px_3()
+                .py_2()
+                .text_sm()
+                .text_color(theme.muted)
+                .child("Select a snapshot to see its changed files.")
+                .into_any_element();
+        }
+        if files.is_empty() {
+            return div()
+                .id("snapshot-files-empty")
+                .flex_1()
+                .px_3()
+                .py_2()
+                .text_sm()
+                .text_color(theme.muted)
+                .child("No file changes in this snapshot.")
+                .into_any_element();
+        }
+        if self.perf_full {
+            self.painted
+                .set(self.painted.get().saturating_add(files.len() as u64));
+            let rows: Vec<gpui::AnyElement> = files
+                .iter()
+                .enumerate()
+                .map(|(index, change)| snapshot_file_row(index, change))
+                .collect();
+            return ScrollArea::new("snapshot-files-scroll")
+                .vertical()
+                .flex_1()
+                .min_h(px(0.))
+                .child(div().w_full().flex().flex_col().children(rows))
+                .into_any_element();
+        }
+        self.virtual_snapshot_files(files)
+    }
+
+    fn virtual_snapshot_files(
+        &self,
+        files: Arc<Vec<gb_bridge::SnapshotChange>>,
+    ) -> gpui::AnyElement {
+        let count = files.len();
+        let painted = Rc::clone(&self.painted);
+        uniform_list("snapshot-files", count, move |range, _, _| {
+            painted.set(painted.get().saturating_add(range.len() as u64));
+            let mut out = Vec::new();
+            for index in range {
+                let Some(change) = files.get(index) else {
+                    continue;
+                };
+                out.push(snapshot_file_row(index, change));
+            }
+            out
+        })
+        .track_scroll(&self.snapshot_file_scroll)
+        .flex_1()
+        .min_h(px(0.))
+        .into_any_element()
+    }
+
+    fn restore_control(
+        &self,
+        can_restore: bool,
+        tip: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        history_button(
+            SharedString::from("restore-snapshot"),
+            "Restore to here",
+            tip,
+            true,
+            can_restore,
+            cx.listener(|this, _: &ClickEvent, _, cx| {
+                if let Err(error) = this.store.ask_restore() {
+                    this.store.toast_bad = true;
+                    this.store.toast = Some(error);
+                }
+                cx.notify();
+            }),
+        )
     }
 
     fn snapshot_create_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if let Some(reason) = self.store.mutation_blocked() {
-            return inert_word(
+            return history_button(
                 SharedString::from("create-snapshot"),
                 "Create snapshot",
                 reason.to_string(),
+                false,
+                false,
+                |_, _, _| {},
             );
         }
         if self.store.pages.history_busy {
-            return wait_slot(
-                SharedString::from("create-snapshot-busy"),
-                "Recording the snapshot".to_string(),
-            );
+            return history_busy();
         }
-        word_button(
+        history_button(
             SharedString::from("create-snapshot"),
             "Create snapshot",
             "Record the project as it is now. An empty message is labeled Created snapshot."
                 .to_string(),
             false,
+            true,
             cx.listener(|this, _: &ClickEvent, _, cx| {
                 let message = this.store.pages.snapshot_message.clone();
                 let effect = this.store.create_snapshot_now(&message);
@@ -7639,6 +8175,208 @@ impl GbWindow {
     }
 }
 
+struct DragCard {
+    icon: IconName,
+    label: SharedString,
+    /// Shown as a badge when a drag carries more than one item.
+    count: usize,
+}
+
+impl Render for DragCard {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme::current();
+        div()
+            .pl_2()
+            .pr(px(if self.count > 1 { 6. } else { 8. }))
+            .h(px(28.))
+            .max_w(px(280.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.raised)
+            .text_sm()
+            .text_color(theme.text)
+            .shadow(cx.theme().elevation(Elevation::Floating))
+            .child(
+                Icon::new(self.icon)
+                    .size(IconSize::Sm)
+                    .color(gpui::Hsla::from(theme.accent)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(self.label.clone()),
+            )
+            .when(self.count > 1, |card| {
+                card.child(
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme.accent)
+                        .text_color(theme.accent_ink)
+                        .text_xs()
+                        .child(format!("{}", self.count)),
+                )
+            })
+    }
+}
+
+fn drag_preview(
+    item: &DropItem,
+    _: gpui::Point<gpui::Pixels>,
+    _: &mut Window,
+    cx: &mut App,
+) -> gpui::Entity<DragCard> {
+    let icon = match item {
+        DropItem::Files(_) => IconName::File,
+        DropItem::Hunk { .. } => IconName::Code,
+        DropItem::Commit(_) => IconName::GitCommitHorizontal,
+        DropItem::Branch(_) => IconName::GitBranch,
+    };
+    let count = match item {
+        DropItem::Files(paths) => paths.len(),
+        _ => 1,
+    };
+    let label = SharedString::from(item.preview_label());
+    cx.new(|_| DragCard { icon, label, count })
+}
+
+/// A drop that merely assigns (file, hunk, or a commit onto a branch) fills the
+/// whole target; it has no above/below meaning.
+fn drop_highlight(
+    style: gpui::StyleRefinement,
+    _: &DropItem,
+    _: &mut Window,
+    _: &mut App,
+) -> gpui::StyleRefinement {
+    let theme = theme::current();
+    style.bg(theme.selected).border_color(theme.accent)
+}
+
+/// True when dropping `payload` on `seat` reorders a list, so the cue is a
+/// positional insertion line rather than a fill. Only like-on-like reorders
+/// (commit on commit, branch on branch) are positional.
+fn is_positional(payload: &DropItem, seat: &DropSeat) -> bool {
+    matches!(
+        (payload, seat),
+        (DropItem::Commit(_), DropSeat::Commit(_))
+            | (DropItem::Branch(_), DropSeat::BranchStack(_))
+    )
+}
+
+/// The cue a half shows while a drag hovers it. A reorder shows a thin accent
+/// line at the boundary where the item lands; it draws no fill, so it never
+/// covers the commit or branch beneath it. An assign fills the target instead,
+/// because it has no above/below position.
+fn drop_feedback(
+    below: bool,
+    seat: DropSeat,
+) -> impl Fn(gpui::StyleRefinement, &DropItem, &mut Window, &mut App) -> gpui::StyleRefinement {
+    move |style, item, window, app| {
+        if is_positional(item, &seat) {
+            let accent = gpui::Hsla::from(theme::current().accent);
+            if below {
+                style.border_color(accent).border_b(px(2.))
+            } else {
+                style.border_color(accent).border_t(px(2.))
+            }
+        } else {
+            drop_highlight(style, item, window, app)
+        }
+    }
+}
+
+/// What a drop half does when a payload lands on it.
+#[derive(Clone)]
+enum DropSeat {
+    /// Reorder commits: a commit lands above or below `sha`.
+    Commit(String),
+    /// Stack a branch above or below this branch. `below` stacks it after the
+    /// branch's last commit, so this seat is mounted on the branch's last row.
+    BranchStack(String),
+    /// Assign a commit, file, or hunk onto this branch; no above/below meaning.
+    /// Mounted on a branch header that is not its own last row.
+    BranchAssign(String),
+}
+
+impl GbWindow {
+    /// The top or bottom half of a row. It is only mounted while a drag is active,
+    /// so a normal click still reaches the row underneath.
+    fn drop_half(
+        &self,
+        id: SharedString,
+        below: bool,
+        seat: DropSeat,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(id)
+            .absolute()
+            .left_0()
+            .right_0()
+            .h(gpui::relative(0.5))
+            .when(below, |half| half.bottom_0())
+            .when(!below, |half| half.top_0())
+            .on_drop(cx.listener({
+                let seat = seat.clone();
+                move |this, item: &DropItem, _, cx| {
+                    let result = match &seat {
+                        DropSeat::Commit(sha) if !below => this.store.drop_before_commit(item, sha),
+                        DropSeat::Commit(sha) => this.store.drop_beside_commit(item, sha, true),
+                        // A branch stacks above (false) or below (true); a commit,
+                        // file, or hunk assigns to the branch tip.
+                        DropSeat::BranchStack(name) => {
+                            let below = below && matches!(item, DropItem::Branch(_));
+                            this.store.drop_beside_branch(item, name, below)
+                        }
+                        // Assign only. Branch payloads never reach here.
+                        DropSeat::BranchAssign(name) => {
+                            this.store.drop_beside_branch(item, name, false)
+                        }
+                    };
+                    this.finish_drop(result, cx);
+                }
+            }))
+            .drag_over(drop_feedback(below, seat.clone()))
+            .can_drop({
+                let seat = seat.clone();
+                move |payload, _, _| half_accepts(payload, &seat)
+            })
+            .into_any_element()
+    }
+}
+
+fn half_accepts(payload: &dyn Any, seat: &DropSeat) -> bool {
+    match payload.downcast_ref::<DropItem>() {
+        Some(DropItem::Commit(sha)) => match seat {
+            DropSeat::Commit(have) => sha != have,
+            // A commit assigns onto a branch; the whole heading is one target.
+            DropSeat::BranchStack(_) | DropSeat::BranchAssign(_) => true,
+        },
+        Some(DropItem::Branch(name)) => match seat {
+            // A branch only stacks beside another branch, never onto a commit or
+            // an assign-only half.
+            DropSeat::BranchStack(have) => name != have,
+            DropSeat::Commit(_) | DropSeat::BranchAssign(_) => false,
+        },
+        Some(DropItem::Files(_) | DropItem::Hunk { .. }) => true,
+        None => false,
+    }
+}
+
+fn accepts_unassign(payload: &dyn Any, _: &mut Window, _: &mut App) -> bool {
+    matches!(
+        payload.downcast_ref::<DropItem>(),
+        Some(DropItem::Files(_) | DropItem::Hunk { .. })
+    )
+}
+
 struct HunkChrome {
     path: String,
     header: String,
@@ -7647,12 +8385,125 @@ struct HunkChrome {
     entity: gpui::Entity<GbWindow>,
 }
 
+fn snap_byte(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn diff_span(pick: &DiffPick, index: usize, text: &str) -> Option<std::ops::Range<usize>> {
+    if !pick.active() {
+        return None;
+    }
+    let (start_line, start_byte, end_line, end_byte) = pick.ordered();
+    if index < start_line || index > end_line {
+        return None;
+    }
+    let start = if index == start_line {
+        snap_byte(text, start_byte)
+    } else {
+        0
+    };
+    let end = if index == end_line {
+        snap_byte(text, end_byte)
+    } else {
+        text.len()
+    };
+    (start < end).then_some(start..end)
+}
+
+fn index_at(layout: &TextLayout, position: gpui::Point<gpui::Pixels>) -> usize {
+    match layout.index_for_position(position) {
+        Ok(index) | Err(index) => index,
+    }
+}
+
+/// The code of one diff line. Drag selects it. The mint ink is the selection.
+fn diff_line_text(
+    index: usize,
+    text: SharedString,
+    span: Option<std::ops::Range<usize>>,
+    entity: gpui::Entity<GbWindow>,
+) -> gpui::AnyElement {
+    let theme = theme::current();
+    let highlight = HighlightStyle {
+        color: Some(gpui::Hsla::from(theme.accent_ink)),
+        background_color: Some(gpui::Hsla::from(theme.accent)),
+        ..Default::default()
+    };
+    let styled = StyledText::new(text.clone());
+    let layout = styled.layout().clone();
+    let styled = match span {
+        Some(span) => styled.with_highlights([(span, highlight)]),
+        None => styled,
+    };
+    div()
+        .id(SharedString::from(format!("diff-select-{index}")))
+        .flex_none()
+        .h_full()
+        .whitespace_nowrap()
+        .cursor(CursorStyle::IBeam)
+        .on_mouse_down(MouseButton::Left, {
+            let layout = layout.clone();
+            let entity = entity.clone();
+            move |event: &MouseDownEvent, _, cx| {
+                let byte = index_at(&layout, event.position);
+                let extend = event.modifiers.shift;
+                entity.update(cx, |this, cx| {
+                    let mut pick = this.diff_pick.borrow_mut();
+                    if !extend {
+                        pick.anchor_line = index;
+                        pick.anchor_byte = byte;
+                    }
+                    pick.head_line = index;
+                    pick.head_byte = byte;
+                    pick.dragging = true;
+                    cx.notify();
+                });
+            }
+        })
+        .on_mouse_move({
+            let layout = layout.clone();
+            let entity = entity.clone();
+            move |event: &MouseMoveEvent, _, cx| {
+                if !event.dragging() {
+                    return;
+                }
+                let byte = index_at(&layout, event.position);
+                entity.update(cx, |this, cx| {
+                    let mut pick = this.diff_pick.borrow_mut();
+                    if !pick.dragging {
+                        return;
+                    }
+                    pick.head_line = index;
+                    pick.head_byte = byte;
+                    cx.notify();
+                });
+            }
+        })
+        .on_mouse_up(MouseButton::Left, {
+            let entity = entity.clone();
+            move |_, _, cx| {
+                entity.update(cx, |this, _| this.diff_pick.borrow_mut().dragging = false);
+            }
+        })
+        .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+            entity.update(cx, |this, _| this.diff_pick.borrow_mut().dragging = false);
+        })
+        .child(styled)
+        .into_any_element()
+}
+
 fn paint_diff_row(
     row: &DiffRow,
     index: usize,
     selected: bool,
     chrome: Option<HunkChrome>,
     text: SharedString,
+    span: Option<std::ops::Range<usize>>,
+    entity: gpui::Entity<GbWindow>,
 ) -> gpui::AnyElement {
     let theme = theme::current();
     let (fg, bg) = match row.kind {
@@ -7671,12 +8522,12 @@ fn paint_diff_row(
     div()
         .id(SharedString::from(format!("diff-line-{index}")))
         .h(px(26.))
-        .w_full()
+        .min_w_full()
         .px_2()
         .flex()
         .items_center()
         .gap_1()
-        .overflow_hidden()
+        .whitespace_nowrap()
         .font_family(ns_ui::CODE_FONT)
         .text_xs()
         .text_color(fg)
@@ -7688,13 +8539,24 @@ fn paint_diff_row(
         })
         .when(selected, |line| line.bg(theme.selected))
         .when(!selected, |line| line.when_some(bg, |line, bg| line.bg(bg)))
-        .tooltip(Tooltip::text(lane_tip))
+        .tooltip(Tooltip::text(if hunk {
+            format!("{lane_tip}. Drag this hunk onto a lane.")
+        } else {
+            lane_tip
+        }))
         .when(hunk && chrome.is_some(), |line| {
             let chrome = chrome.as_ref().expect("hunk");
             let path = chrome.path.clone();
             let header = chrome.header.clone();
             let entity = chrome.entity.clone();
-            line.on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
+            line.on_drag(
+                DropItem::Hunk {
+                    path: path.clone(),
+                    header: header.clone(),
+                },
+                drag_preview,
+            )
+            .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
                 cx.stop_propagation();
                 let x = event.position.x.as_f32();
                 let y = event.position.y.as_f32();
@@ -7706,9 +8568,41 @@ fn paint_diff_row(
                 });
             })
         })
+        .on_mouse_up(MouseButton::Left, {
+            let entity = entity.clone();
+            move |_, _, cx| {
+                entity.update(cx, |this, _| this.diff_pick.borrow_mut().dragging = false);
+            }
+        })
+        .on_mouse_move({
+            let entity = entity.clone();
+            move |event: &MouseMoveEvent, _, cx| {
+                if !hunk || !event.dragging() {
+                    return;
+                }
+                entity.update(cx, |this, cx| {
+                    let mut pick = this.diff_pick.borrow_mut();
+                    if !pick.dragging {
+                        return;
+                    }
+                    pick.head_line = index;
+                    pick.head_byte = 0;
+                    cx.notify();
+                });
+            }
+        })
         .child(gutter(row.old_line))
         .child(gutter(row.new_line))
-        .child(div().flex_1().min_w(px(0.)).truncate().child(text))
+        .child(if hunk {
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .whitespace_nowrap()
+                .child(text)
+                .into_any_element()
+        } else {
+            diff_line_text(index, text, span, entity)
+        })
         .when_some(row.lane.clone(), |line, lane| {
             line.when(hunk, |line| {
                 line.child(
@@ -7855,6 +8749,112 @@ fn pace_sentence(id: &str, lead: &str) -> String {
     }
 }
 
+fn snapshot_file_row(index: usize, change: &gb_bridge::SnapshotChange) -> gpui::AnyElement {
+    let path = change.path.clone();
+    let status = change.status;
+    div()
+        .id(SharedString::from(format!("snapshot-file-{index}")))
+        .h(px(32.))
+        .px_3()
+        .flex()
+        .items_center()
+        .gap_2()
+        .overflow_hidden()
+        .font_family(ns_ui::CODE_FONT)
+        .text_xs()
+        .tooltip(Tooltip::text(format!(
+            "{} {path}",
+            store::file_change_label(status)
+        )))
+        .child(status_mark(status))
+        .child(div().min_w(px(0.)).truncate().child(path))
+        .into_any_element()
+}
+
+/// History actions are 40px. Restore is the one filled button. Create stays
+/// an outline. A disabled control loses the click, fades, and shows a blocked cursor.
+fn history_button(
+    id: SharedString,
+    label: &'static str,
+    tip: String,
+    primary: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::AnyElement {
+    let theme = theme::current();
+    let fill = if primary && enabled {
+        theme.accent
+    } else {
+        theme.background
+    };
+    let ink = if !enabled {
+        theme.muted
+    } else if primary {
+        theme.accent_ink
+    } else {
+        theme.text
+    };
+    let edge = if primary && enabled {
+        theme.accent
+    } else {
+        theme.border
+    };
+    let hover_fill = if primary && enabled {
+        theme.accent_hover
+    } else {
+        theme.hover
+    };
+    let button = div()
+        .id(id)
+        .h(px(40.))
+        .min_w(px(44.))
+        .px_3()
+        .flex_none()
+        .rounded_sm()
+        .border_1()
+        .border_color(gpui::Hsla::from(edge))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(fill)
+        .text_xs()
+        .text_color(ink)
+        .tooltip(Tooltip::text(tip))
+        .child(label);
+    if enabled {
+        button
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_fill))
+            .active(move |style| style.bg(hover_fill))
+            .on_click(on_click)
+            .into_any_element()
+    } else {
+        button.cursor_not_allowed().opacity(0.55).into_any_element()
+    }
+}
+
+fn history_busy() -> gpui::AnyElement {
+    let theme = theme::current();
+    div()
+        .id("create-snapshot-busy")
+        .h(px(40.))
+        .min_w(px(44.))
+        .px_3()
+        .flex_none()
+        .rounded_sm()
+        .border_1()
+        .border_color(gpui::Hsla::from(theme.border))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .text_color(theme.accent)
+        .cursor_not_allowed()
+        .tooltip(Tooltip::text("Recording the snapshot"))
+        .child("…")
+        .into_any_element()
+}
+
 fn word_button(
     id: SharedString,
     label: &'static str,
@@ -7964,6 +8964,54 @@ fn gutter(line: Option<u32>) -> gpui::Div {
         .text_right()
         .text_color(theme.muted)
         .child(line.map(|line| line.to_string()).unwrap_or_default())
+}
+
+/// Folder prefix in muted ink, then the file name. The folder gives way first.
+fn file_title(path: &str, marked: bool) -> gpui::Div {
+    let theme = theme::current();
+    let (dir, name) = match path.rfind('/') {
+        Some(split) => (&path[..=split], &path[split + 1..]),
+        None => ("", path),
+    };
+    let name_color = if marked {
+        gpui::Hsla::from(theme.accent)
+    } else {
+        gpui::Hsla::from(theme.text)
+    };
+    let dir_color = if marked {
+        gpui::Hsla::from(theme.accent)
+    } else {
+        gpui::Hsla::from(theme.muted)
+    };
+    div()
+        .flex_1()
+        .min_w(px(0.))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .font_family(ns_ui::CODE_FONT)
+        .text_xs()
+        .when(!dir.is_empty(), |row| {
+            row.child(
+                div()
+                    .flex_grow_0()
+                    .flex_shrink(1000.)
+                    .min_w(px(12.))
+                    .overflow_hidden()
+                    .truncate()
+                    .text_color(dir_color)
+                    .child(dir.to_string()),
+            )
+        })
+        .child(
+            div()
+                .flex_initial()
+                .min_w(px(12.))
+                .overflow_hidden()
+                .truncate()
+                .text_color(name_color)
+                .child(name.to_string()),
+        )
 }
 
 fn status_mark(status: FileStatus) -> gpui::Div {
@@ -8592,6 +9640,15 @@ fn key_token(keystroke: &gpui::Keystroke) -> Option<String> {
         if key == "," || key.eq_ignore_ascii_case("comma") {
             return Some("cmd-comma".to_string());
         }
+        if key.eq_ignore_ascii_case("a") {
+            return Some("cmd-a".to_string());
+        }
+    }
+    if mods.shift && !mods.platform && !mods.control && !mods.alt && !mods.function {
+        match key {
+            "up" | "down" | "j" | "k" => return Some(format!("shift-{key}")),
+            _ => {}
+        }
     }
     if mods.platform || mods.control || mods.alt || mods.function {
         return None;
@@ -9072,9 +10129,15 @@ impl ns_ui::DevControl for GbWindow {
             }
             "focus" => {
                 if let Some(name) = arg_text(args, "branch") {
-                    if !self.store.focus_branch(&name) {
+                    let effect = self.store.focus_branch(&name);
+                    let focused = self
+                        .store
+                        .branch_info()
+                        .is_some_and(|info| info.name == name);
+                    if !focused {
                         return Err(format!("no branch {name}"));
                     }
+                    self.activate(effect, cx);
                     cx.notify();
                     Ok(serde_json::json!({ "branch": name, "detail_pane": true }))
                 } else if let Some(commit) = arg_text(args, "commit") {
@@ -9890,4 +10953,110 @@ fn page_flags(store: &Store) -> serde_json::Value {
         "conflict_file": file.map(|file| file.path.clone()),
         "conflict_side": file.and_then(|file| file.side.map(store::side_name)),
     })
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::{DropItem, DropSeat, half_accepts, is_positional};
+
+    fn commit(sha: &str) -> DropItem {
+        DropItem::Commit(sha.to_string())
+    }
+    fn branch(name: &str) -> DropItem {
+        DropItem::Branch(name.to_string())
+    }
+    fn files() -> DropItem {
+        DropItem::Files(vec!["a.rs".to_string()])
+    }
+    fn hunk() -> DropItem {
+        DropItem::Hunk {
+            path: "a.rs".to_string(),
+            header: "@@ -1 +1 @@".to_string(),
+        }
+    }
+
+    #[test]
+    fn branch_never_drops_onto_a_commit() {
+        // The reported bug: dragging a branch lit an insertion line between
+        // every commit. A branch only stacks beside another branch.
+        assert!(!half_accepts(
+            &branch("feat") as _,
+            &DropSeat::Commit("abc".into())
+        ));
+    }
+
+    #[test]
+    fn branch_never_drops_on_an_assign_only_half() {
+        // A non-last branch header's bottom half assigns only; stacking below
+        // happens on the branch's last commit, not under the header.
+        assert!(!half_accepts(
+            &branch("feat") as _,
+            &DropSeat::BranchAssign("main".into())
+        ));
+    }
+
+    #[test]
+    fn branch_stacks_only_beside_another_branch() {
+        let seat = DropSeat::BranchStack("main".into());
+        assert!(half_accepts(&branch("feat") as _, &seat));
+        assert!(is_positional(&branch("feat"), &seat));
+        // Stacking is a reorder, so it shows an insertion line.
+    }
+
+    #[test]
+    fn commit_drops_onto_a_branch_as_one_target() {
+        // A commit assigns onto a branch; it is accepted but is not a positional
+        // reorder, so the half fills rather than shows an insertion line.
+        for seat in [
+            DropSeat::BranchStack("feat".into()),
+            DropSeat::BranchAssign("feat".into()),
+        ] {
+            assert!(half_accepts(&commit("abc") as _, &seat));
+            assert!(!is_positional(&commit("abc"), &seat));
+        }
+    }
+
+    #[test]
+    fn like_on_like_is_positional() {
+        assert!(is_positional(&commit("a"), &DropSeat::Commit("b".into())));
+        assert!(is_positional(
+            &branch("a"),
+            &DropSeat::BranchStack("b".into())
+        ));
+    }
+
+    #[test]
+    fn cross_kind_and_assign_are_not_positional() {
+        assert!(!is_positional(
+            &commit("a"),
+            &DropSeat::BranchStack("b".into())
+        ));
+        assert!(!is_positional(&branch("a"), &DropSeat::Commit("b".into())));
+        assert!(!is_positional(&files(), &DropSeat::Commit("b".into())));
+        assert!(!is_positional(&hunk(), &DropSeat::BranchStack("b".into())));
+    }
+
+    #[test]
+    fn a_row_never_accepts_itself() {
+        assert!(!half_accepts(
+            &commit("abc") as _,
+            &DropSeat::Commit("abc".into())
+        ));
+        assert!(!half_accepts(
+            &branch("feat") as _,
+            &DropSeat::BranchStack("feat".into())
+        ));
+    }
+
+    #[test]
+    fn files_and_hunks_assign_to_any_seat() {
+        for seat in [
+            DropSeat::Commit("c".into()),
+            DropSeat::BranchStack("b".into()),
+            DropSeat::BranchAssign("b".into()),
+        ] {
+            assert!(half_accepts(&files() as _, &seat));
+            assert!(half_accepts(&hunk() as _, &seat));
+        }
+    }
 }

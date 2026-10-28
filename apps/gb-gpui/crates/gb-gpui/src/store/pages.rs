@@ -242,6 +242,9 @@ pub struct Pages {
     pub branches_open: bool,
     pub tab: BranchTab,
     pub filter: String,
+    /// True while the native filter input holds focus, so the key router
+    /// leaves typing and editing to the input.
+    pub filter_focused: bool,
     pub branch_rows: Vec<BranchRow>,
     pub branch_cursor: usize,
     /// Vertical scroll of the branches list, in points. Switching pages keeps it.
@@ -288,6 +291,7 @@ impl Default for Pages {
             branches_open: false,
             tab: BranchTab::Local,
             filter: String::new(),
+            filter_focused: false,
             branch_rows: Vec::new(),
             branch_cursor: 0,
             branch_scroll: 0,
@@ -542,6 +546,23 @@ impl Store {
             .borrow_mut()
             .branch_filter
             .clone_from(&self.pages.filter);
+    }
+
+    /// Mirror the native filter input's text into the filter. The window then
+    /// debounces the committed value the same way typing did.
+    pub fn set_filter_text(&mut self, text: &str) {
+        if self.pages.filter != text {
+            self.pages.filter.clear();
+            self.pages.filter.push_str(text);
+            self.clamp_branch_cursor();
+            self.clamp_review_cursor();
+        }
+    }
+
+    /// Record whether the native filter input holds focus, so the key router
+    /// leaves text editing to it.
+    pub fn set_filter_focused(&mut self, focused: bool) {
+        self.pages.filter_focused = focused;
     }
 
     /// `Some` while a commit is checked out. Mutation controls use this as their tooltip.
@@ -1287,13 +1308,15 @@ impl Store {
                 Effect::None
             }
             "enter" => self.primary_branch_action(),
-            "backspace" => {
+            // The native filter input owns text editing while it is focused;
+            // the router only edits the filter string when it is not.
+            "backspace" if !self.pages.filter_focused => {
                 self.pages.filter.pop();
                 self.clamp_branch_cursor();
                 self.clamp_review_cursor();
                 Effect::None
             }
-            other if is_typed(other) => {
+            other if !self.pages.filter_focused && is_typed(other) => {
                 self.pages.filter.push_str(other);
                 self.clamp_branch_cursor();
                 self.clamp_review_cursor();
@@ -1421,7 +1444,7 @@ impl Store {
         }
     }
 
-    fn primary_branch_action(&mut self) -> Effect {
+    pub fn primary_branch_action(&mut self) -> Effect {
         if self.pages.tab == BranchTab::PullRequests {
             return Effect::None;
         }

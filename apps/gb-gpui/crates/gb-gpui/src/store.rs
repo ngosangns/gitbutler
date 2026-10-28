@@ -27,8 +27,8 @@ pub use layout::{
     persistent_file, save_fractions,
 };
 pub use mutate::{
-    Action, ActionMenu, BusyOp, Composer, Field, MutationDone, PendingConfirm, RewordDraft,
-    perform_action,
+    Action, ActionMenu, BusyOp, Composer, DropItem, Field, MutationDone, PendingConfirm,
+    RewordDraft, perform_action,
 };
 #[cfg(any(test, feature = "devtools"))]
 pub use pages::side_name;
@@ -40,7 +40,7 @@ pub use perf::{
     DIFF_PAGE, REFRESH_QUIET_MS, RefreshGate, measure as perf_measure, seed_detail_workspace,
     seed_diff, seed_files, seed_git_event, seed_large_branches, seed_large_files,
     seed_large_reviews, seed_large_snapshot_files, seed_large_workspace, seed_snapshots,
-    seed_workspace, visible_window,
+    seed_workspace,
 };
 pub use remote::{
     PUSH_CHOICES, RemoteDone, RemoteOp, RemoteUi, askpass_label, perform_remote, push_choice_tip,
@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use gb_bridge::{
-    Backend, BranchRow, BridgeEvent, CommitDetails, CommitSummary, Compat, DiffRequest,
+    Backend, BranchRow, BridgeEvent, CommitDetails, CommitFile, CommitSummary, Compat, DiffRequest,
     Environment, FileChange, ForgeStatus, ProjectSummary, Review, SelectionSpec, WorkspaceSummary,
     WorktreeView,
 };
@@ -144,6 +144,7 @@ pub enum ShownFile {
     None,
     Worktree { path: String },
     Commit { sha: String, path: String },
+    Branch { name: String, path: String },
 }
 
 /// Reported by the dev socket. A commit or branch wins over a file, because
@@ -177,6 +178,8 @@ pub enum Effect {
     Refresh,
     SelectProject(String),
     ShowCommit(String),
+    /// Read every file the named branch changes.
+    ShowBranch(String),
     ShowDiff(DiffRequest),
     Mutate(Action),
     Remote(RemoteOp),
@@ -308,6 +311,11 @@ pub struct Store {
     pub diff_loading: bool,
     pub commit_error: Option<String>,
     pub diff_error: Option<String>,
+    /// Files the focused branch changes, compared with its base.
+    pub branch_changes: Option<Arc<Vec<CommitFile>>>,
+    /// Branch name `branch_changes` belongs to.
+    pub branch_changes_for: Option<String>,
+    pub branch_files_error: Option<String>,
     pub commit: Option<CommitDetails>,
     pub diff_rows: Arc<Vec<DiffRow>>,
     pub hunk_cursor: usize,
@@ -375,6 +383,9 @@ impl Default for Store {
             diff_loading: false,
             commit_error: None,
             diff_error: None,
+            branch_changes: None,
+            branch_changes_for: None,
+            branch_files_error: None,
             commit: None,
             diff_rows: Arc::new(Vec::new()),
             hunk_cursor: 0,
@@ -704,6 +715,15 @@ impl Store {
                 self.move_cursor(1);
                 (Effect::None, true)
             }
+            "shift-up" | "shift-k" => (Effect::None, self.extend_marks(-1)),
+            "shift-down" | "shift-j" => (Effect::None, self.extend_marks(1)),
+            "cmd-a" | "cmd-A" => {
+                if self.pane == Pane::Changes {
+                    (Effect::None, false)
+                } else {
+                    (Effect::None, self.select_visible_files())
+                }
+            }
             "left" | "shift-tab" => {
                 self.cycle(-1);
                 (Effect::None, true)
@@ -787,7 +807,7 @@ impl Store {
         }
         let path = self.uncommitted_path().or_else(|| match &self.shown {
             ShownFile::Worktree { path } => Some(path.clone()),
-            ShownFile::None | ShownFile::Commit { .. } => None,
+            ShownFile::None | ShownFile::Commit { .. } | ShownFile::Branch { .. } => None,
         });
         self.view = mode;
         if mode == ViewMode::Tree
@@ -844,7 +864,9 @@ impl Store {
             SideFocus::Branch { .. } => FocusedKind::Branch,
             SideFocus::None => match &self.shown {
                 ShownFile::None => FocusedKind::None,
-                ShownFile::Worktree { .. } | ShownFile::Commit { .. } => FocusedKind::File,
+                ShownFile::Worktree { .. }
+                | ShownFile::Commit { .. }
+                | ShownFile::Branch { .. } => FocusedKind::File,
             },
         }
     }
@@ -1189,6 +1211,32 @@ impl Store {
         Arc::clone(&derived.lane_rows)
     }
 
+    /// The branch name a drop should stack *under* when it lands on lane row
+    /// `index`, or `None` when the row is not the last row of its branch.
+    /// The last row of a branch is its final commit, or the header itself when
+    /// the branch has no visible commits. A branch stacks below another branch
+    /// after its last commit, so the insertion cue belongs on this row.
+    pub fn branch_below_anchor(&self, index: usize) -> Option<String> {
+        let rows = self.lane_rows();
+        let here = rows.get(index)?;
+        let last_of_branch = match rows.get(index + 1) {
+            Some(next) => next.stack != here.stack || next.branch != here.branch,
+            None => true,
+        };
+        if !last_of_branch {
+            return None;
+        }
+        let workspace = self.workspace.as_deref()?;
+        let name = workspace
+            .stacks
+            .get(here.stack)?
+            .branches
+            .get(here.branch)?
+            .name
+            .clone();
+        Some(name)
+    }
+
     #[cfg(any(test, feature = "devtools"))]
     pub fn lane_rebuilds(&self) -> u64 {
         self.derived.borrow().lane_rebuilds
@@ -1357,9 +1405,9 @@ impl Store {
         Effect::ShowCommit(resolved)
     }
 
-    pub fn focus_branch(&mut self, name: &str) -> bool {
+    pub fn focus_branch(&mut self, name: &str) -> Effect {
         let Some((stack_index, branch_index)) = self.find_branch(name) else {
-            return false;
+            return Effect::None;
         };
         if let Some(position) = self.lane_rows().iter().position(|item| {
             item.commit.is_none() && item.stack == stack_index && item.branch == branch_index
@@ -1378,6 +1426,9 @@ impl Store {
             self.diff_rows = Arc::new(Vec::new());
             self.diff_loading = false;
             self.diff_error = None;
+            self.branch_changes = None;
+            self.branch_changes_for = None;
+            self.branch_files_error = None;
         }
         self.side = SideFocus::Branch {
             stack: stack_index,
@@ -1387,7 +1438,58 @@ impl Store {
         self.commit_error = None;
         self.cursors[Pane::Detail.index()] = 0;
         self.pane = Pane::Detail;
-        true
+        let loaded = !switching
+            && self.branch_changes.is_some()
+            && self.branch_changes_for.as_deref() == Some(name);
+        if loaded {
+            Effect::None
+        } else {
+            Effect::ShowBranch(name.to_string())
+        }
+    }
+
+    pub fn set_branch_files(&mut self, name: &str, result: Result<Vec<CommitFile>, String>) {
+        if self.focused_branch_name().as_deref() != Some(name) {
+            return;
+        }
+        match result {
+            Ok(files) => {
+                if let ShownFile::Branch { name: shown, path } = &self.shown
+                    && shown == name
+                    && !files.iter().any(|file| file.path == *path)
+                {
+                    self.shown = ShownFile::None;
+                    self.diff_rows = Arc::new(Vec::new());
+                    self.diff_loading = false;
+                    self.diff_error = None;
+                }
+                self.branch_changes = Some(Arc::new(files));
+                self.branch_changes_for = Some(name.to_string());
+                self.branch_files_error = None;
+                self.activity
+                    .succeed("branch_files", "The branch files are ready.");
+            }
+            Err(message) => {
+                self.branch_changes = None;
+                self.branch_changes_for = None;
+                self.activity.fail("branch_files", message.clone());
+                self.branch_files_error = Some(message);
+            }
+        }
+        self.clamp();
+    }
+
+    fn branch_files_ready(&self) -> bool {
+        self.focused_branch_name()
+            .is_some_and(|name| self.branch_changes_for.as_deref() == Some(name.as_str()))
+            && self.branch_changes.is_some()
+    }
+
+    fn branch_file_at(&self, index: usize) -> Option<&CommitFile> {
+        if !self.branch_files_ready() {
+            return None;
+        }
+        self.branch_changes.as_ref()?.get(index)
     }
 
     pub fn branch_info(&self) -> Option<BranchFocusInfo> {
@@ -1498,6 +1600,7 @@ impl Store {
             Effect::Refresh => Some(("refresh_status", None)),
             Effect::SelectProject(_) => Some(("open_project", None)),
             Effect::ShowCommit(_) => Some(("commit_details", None)),
+            Effect::ShowBranch(_) => Some(("branch_files", None)),
             Effect::ShowDiff(_) => Some(("file_diff", None)),
             Effect::Mutate(action) => Some(mutate::mutation_activity(action)),
             Effect::Remote(op) => Some(remote::remote_activity(op)),
@@ -1535,17 +1638,10 @@ impl Store {
                     .and_then(|commit| commit.files.get(self.cursor(Pane::Detail)))
                     .map(|file| file.path.clone())
                     .or_else(|| Some(sha.clone())),
-                SideFocus::Branch { stack, branch } => self
-                    .workspace
-                    .as_ref()
-                    .and_then(|workspace| workspace.stacks.get(*stack))
-                    .and_then(|item| item.branches.get(*branch))
-                    .and_then(|item| {
-                        item.commits
-                            .get(self.cursor(Pane::Detail))
-                            .map(|commit| commit.sha.clone())
-                            .or_else(|| Some(item.name.clone()))
-                    }),
+                SideFocus::Branch { .. } => self
+                    .branch_file_at(self.cursor(Pane::Detail))
+                    .map(|file| file.path.clone())
+                    .or_else(|| self.focused_branch_name()),
                 SideFocus::None => None,
             },
         }
@@ -1554,7 +1650,9 @@ impl Store {
     pub fn shown_path(&self) -> Option<String> {
         match &self.shown {
             ShownFile::None => None,
-            ShownFile::Worktree { path } | ShownFile::Commit { path, .. } => Some(path.clone()),
+            ShownFile::Worktree { path }
+            | ShownFile::Commit { path, .. }
+            | ShownFile::Branch { path, .. } => Some(path.clone()),
         }
     }
 
@@ -1580,6 +1678,7 @@ impl Store {
                     None => format!("Commit {short}: {path}"),
                 })
             }
+            ShownFile::Branch { name, path } => Some(format!("Branch {name}: {path}")),
         }
     }
 
@@ -1719,6 +1818,10 @@ impl Store {
                 SideFocus::Commit { sha } => Effect::ShowCommit(sha.clone()),
                 _ => Effect::None,
             },
+            "branch_files" => self
+                .focused_branch_name()
+                .map(Effect::ShowBranch)
+                .unwrap_or(Effect::None),
             "suggest_message" => self.request_suggestion(),
             "integrate_preview" => self.open_integrate(),
             "integrate" => self.confirm_integrate(),
@@ -1761,6 +1864,9 @@ impl Store {
         self.commit_error = None;
         self.diff_error = None;
         self.commit = None;
+        self.branch_changes = None;
+        self.branch_changes_for = None;
+        self.branch_files_error = None;
         self.diff_rows = Arc::new(Vec::new());
         self.hunk_cursor = 0;
     }
@@ -1770,6 +1876,10 @@ impl Store {
             DiffRequest::Worktree { path } => ShownFile::Worktree { path: path.clone() },
             DiffRequest::Commit { sha, path } => ShownFile::Commit {
                 sha: sha.clone(),
+                path: path.clone(),
+            },
+            DiffRequest::Branch { name, path } => ShownFile::Branch {
+                name: name.clone(),
                 path: path.clone(),
             },
         };
@@ -1788,6 +1898,10 @@ impl Store {
             ShownFile::Worktree { path } => Some(DiffRequest::Worktree { path: path.clone() }),
             ShownFile::Commit { sha, path } => Some(DiffRequest::Commit {
                 sha: sha.clone(),
+                path: path.clone(),
+            }),
+            ShownFile::Branch { name, path } => Some(DiffRequest::Branch {
+                name: name.clone(),
                 path: path.clone(),
             }),
         }
@@ -1832,8 +1946,7 @@ impl Store {
         if let Some(sha) = sha {
             self.focus_commit(&sha)
         } else {
-            self.focus_branch(&name);
-            Effect::None
+            self.focus_branch(&name)
         }
     }
 
@@ -1854,18 +1967,15 @@ impl Store {
                     path: file.path.clone(),
                 })
             }
-            SideFocus::Branch { stack, branch } => {
-                let Some(sha) = self
-                    .workspace
-                    .as_ref()
-                    .and_then(|workspace| workspace.stacks.get(stack))
-                    .and_then(|item| item.branches.get(branch))
-                    .and_then(|item| item.commits.get(self.cursor(Pane::Detail)))
-                    .map(|commit| commit.sha.clone())
-                else {
+            SideFocus::Branch { .. } => {
+                let Some(name) = self.focused_branch_name() else {
                     return Effect::None;
                 };
-                self.focus_commit(&sha)
+                let Some(file) = self.branch_file_at(self.cursor(Pane::Detail)) else {
+                    return Effect::None;
+                };
+                let path = file.path.clone();
+                self.begin_diff(DiffRequest::Branch { name, path })
             }
             SideFocus::None => Effect::None,
         }
@@ -1989,12 +2099,11 @@ impl Store {
                     .filter(|commit| commit.sha == *sha || commit.short_sha == *sha)
                     .map(|commit| commit.files.len())
                     .unwrap_or(0),
-                SideFocus::Branch { stack, branch } => self
-                    .workspace
+                SideFocus::Branch { .. } => self
+                    .branch_changes
                     .as_ref()
-                    .and_then(|workspace| workspace.stacks.get(*stack))
-                    .and_then(|item| item.branches.get(*branch))
-                    .map(|item| item.commits.len())
+                    .filter(|_| self.branch_files_ready())
+                    .map(|files| files.len())
                     .unwrap_or(0),
                 SideFocus::None => 0,
             },
@@ -2144,6 +2253,19 @@ impl Store {
             acc.push_str(part);
             self.dirs_collapsed.remove(&acc);
         }
+    }
+
+    fn focused_branch_name(&self) -> Option<String> {
+        let SideFocus::Branch { stack, branch } = &self.side else {
+            return None;
+        };
+        self.workspace
+            .as_ref()?
+            .stacks
+            .get(*stack)?
+            .branches
+            .get(*branch)
+            .map(|branch| branch.name.clone())
     }
 
     fn find_branch(&self, name: &str) -> Option<(usize, usize)> {
@@ -2460,6 +2582,9 @@ pub fn build_tree(files: &[FileChange]) -> Vec<TreeNode> {
         );
     }
     finish(&mut roots);
+    // GitButler's `abbreviateFolders`: a directory whose only child is another
+    // directory becomes one row, `folder/subFolder`.
+    abbreviate_folders(&mut roots);
     roots
 }
 
@@ -2546,6 +2671,11 @@ fn finish(nodes: &mut [TreeNode]) {
             node.file_count = 1;
         }
     }
+    sort_tree_nodes(nodes);
+}
+
+/// Directories first, then by name. The same paths always land in the same order.
+fn sort_tree_nodes(nodes: &mut [TreeNode]) {
     nodes.sort_by(
         |left, right| match (left.file.is_none(), right.file.is_none()) {
             (true, false) => Ordering::Less,
@@ -2553,6 +2683,30 @@ fn finish(nodes: &mut [TreeNode]) {
             _ => left.name.cmp(&right.name),
         },
     );
+}
+
+/// Collapse a chain of directories that each contain only another directory.
+fn abbreviate_folders(nodes: &mut [TreeNode]) {
+    for node in nodes.iter_mut() {
+        abbreviate_node(node);
+    }
+    sort_tree_nodes(nodes);
+}
+
+fn abbreviate_node(node: &mut TreeNode) {
+    if node.file.is_some() {
+        return;
+    }
+    while node.children.len() == 1 && node.children[0].file.is_none() {
+        let child = node.children.remove(0);
+        node.name = format!("{}/{}", node.name, child.name);
+        node.path = child.path;
+        node.children = child.children;
+        node.additions = child.additions;
+        node.deletions = child.deletions;
+        node.file_count = child.file_count;
+    }
+    abbreviate_folders(&mut node.children);
 }
 
 pub fn visible_tree(nodes: &[TreeNode], collapsed: &BTreeSet<String>) -> Vec<TreeRow> {
@@ -2685,7 +2839,7 @@ pub fn load(backend: &dyn Backend, selected: Option<&str>) -> Loaded {
 mod tests {
     use super::*;
     use gb_bridge::{
-        AssignedHunk, BranchPlace, BranchRow, BranchSummary, CommitFile, CommitSummary,
+        AssignedHunk, Backend, BranchPlace, BranchRow, BranchSummary, CommitFile, CommitSummary,
         FakeBackend, FileStatus, StackSummary,
     };
 
@@ -2740,6 +2894,25 @@ mod tests {
         assert!(labels.iter().any(|label| label == "split"), "{labels:?}");
         assert_eq!(COLUMNS, 3);
         assert_eq!(store.pane, Pane::Uncommitted);
+    }
+
+    #[test]
+    fn shift_extends_and_shrinks_the_file_selection() {
+        let (_backend, mut store) = ready();
+        store.pane = Pane::Uncommitted;
+        store.set_cursor(Pane::Uncommitted, 0);
+        let first = store.uncommitted_path().expect("file");
+        assert!(store.extend_marks(1));
+        let second = store.uncommitted_path().expect("next file");
+        assert_ne!(first, second);
+        assert!(store.file_marked(&first));
+        assert!(store.file_marked(&second));
+        assert!(store.extend_marks(-1));
+        assert_eq!(store.uncommitted_path().as_deref(), Some(first.as_str()));
+        assert!(store.file_marked(&first));
+        assert!(!store.file_marked(&second));
+        assert!(store.select_visible_files());
+        assert!(store.marked.len() >= 2);
     }
 
     #[test]
@@ -2900,7 +3073,10 @@ mod tests {
         assert_eq!(store.apply_key("cmd-r"), Effect::Refresh);
         store.pane = Pane::Branches;
         store.cursors[Pane::Branches.index()] = 0;
-        assert_eq!(store.apply_key("enter"), Effect::None);
+        assert!(matches!(
+            store.apply_key("enter"),
+            Effect::ShowBranch(ref name) if name == "lane-a"
+        ));
         assert!(matches!(
             store.side,
             SideFocus::Branch {
@@ -3071,6 +3247,49 @@ mod tests {
     }
 
     #[test]
+    fn single_child_folders_collapse_into_one_path() {
+        let files = vec![
+            change("crates/gb-gpui/src/main.rs", 1, 0),
+            change("crates/gb-gpui/src/store.rs", 2, 1),
+            change("only/nested/deep/file.rs", 3, 0),
+            change("a/b/c.rs", 1, 0),
+            change("a/d.rs", 4, 0),
+        ];
+        let tree = build_tree(&files);
+        let names: Vec<_> = tree.iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "crates/gb-gpui/src", "only/nested/deep"]);
+        let src = tree
+            .iter()
+            .find(|node| node.name == "crates/gb-gpui/src")
+            .expect("collapsed folder");
+        assert_eq!(src.path, "crates/gb-gpui/src");
+        assert_eq!(src.file_count, 2);
+        assert_eq!(src.additions, 3);
+        assert_eq!(src.deletions, 1);
+        let kids: Vec<_> = src.children.iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(kids, vec!["main.rs", "store.rs"]);
+        let parent = tree.iter().find(|node| node.path == "a").expect("a");
+        let parent_names: Vec<_> = parent
+            .children
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(parent_names, vec!["b", "d.rs"]);
+        let rows = visible_tree(&tree, &BTreeSet::new());
+        assert!(
+            rows.iter().any(|row| {
+                row.path == "crates/gb-gpui/src" && row.file.is_none() && row.expanded
+            })
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.path == "crates/gb-gpui/src/main.rs")
+        );
+        assert!(!rows.iter().any(|row| row.path == "crates"));
+        assert!(!rows.iter().any(|row| row.path == "only"));
+    }
+
+    #[test]
     fn file_focus_switches_between_the_worktree_and_a_commit() {
         let (_backend, mut store) = ready();
         store.pane = Pane::Uncommitted;
@@ -3128,7 +3347,10 @@ mod tests {
     #[test]
     fn branch_focus_fills_the_split_and_escape_removes_it() {
         let (_backend, mut store) = ready();
-        assert!(store.focus_branch("lane-b"));
+        assert!(matches!(
+            store.focus_branch("lane-b"),
+            Effect::ShowBranch(_)
+        ));
         assert_eq!(store.panes().len(), 4);
         assert_eq!(store.pane, Pane::Detail);
         let info = store.branch_info().expect("branch");
@@ -3148,6 +3370,33 @@ mod tests {
         assert!(!store.detail_open());
         assert_eq!(store.panes().len(), 3);
         assert!(store.branch_info().is_none());
+    }
+
+    #[test]
+    fn focusing_a_branch_lists_every_changed_file() {
+        let (backend, mut store) = ready();
+        let effect = store.focus_branch("lane-b");
+        assert!(matches!(effect, Effect::ShowBranch(ref name) if name == "lane-b"));
+        let files = backend.branch_files("demo-project", "lane-b").unwrap();
+        let paths: Vec<_> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, vec!["docs/notes.md", "src/helper.rs"]);
+        store.set_branch_files("lane-b", Ok(files));
+        assert_eq!(store.list_len(Pane::Detail), 2);
+        store.cursors[Pane::Detail.index()] = 1;
+        let effect = store.open_current();
+        assert!(matches!(
+            effect,
+            Effect::ShowDiff(DiffRequest::Branch { ref name, ref path })
+                if name == "lane-b" && path == "src/helper.rs"
+        ));
+        assert!(matches!(
+            store.shown,
+            ShownFile::Branch { ref path, .. } if path == "src/helper.rs"
+        ));
+        assert_eq!(
+            store.changes_heading().as_deref(),
+            Some("Branch lane-b: src/helper.rs")
+        );
     }
 
     #[test]
@@ -3340,7 +3589,7 @@ mod tests {
     fn branch_info_matches_the_scan_dedups_authors_and_refreshes() {
         let (_backend, mut store) = ready();
         for name in ["lane-a", "lane-b", "lane-c"] {
-            assert!(store.focus_branch(name));
+            assert!(matches!(store.focus_branch(name), Effect::ShowBranch(_)));
             assert_eq!(store.branch_info(), branch_info_scan(&store), "{name}");
         }
 
@@ -3372,7 +3621,7 @@ mod tests {
             }],
         };
         store.workspace = Some(Arc::new(workspace));
-        assert!(store.focus_branch("multi"));
+        assert!(matches!(store.focus_branch("multi"), Effect::ShowBranch(_)));
         let info = store.branch_info().expect("info");
         assert_eq!(info.authors, vec!["Bea", "Ada", "Cid"]);
         assert_eq!(info, branch_info_scan(&store).unwrap());

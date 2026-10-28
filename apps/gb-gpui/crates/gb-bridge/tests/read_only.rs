@@ -703,6 +703,8 @@ fn commit_details_include_message_author_and_files() {
         details.files.iter().any(|file| file.path == "a.txt"),
         "{details:?}"
     );
+    let files = backend.branch_files(&fixture.id, "lane-a").unwrap();
+    assert!(files.iter().any(|file| file.path == "a.txt"), "{files:?}");
 }
 
 #[test]

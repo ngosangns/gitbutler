@@ -308,8 +308,18 @@ pub struct CommitFile {
 /// Which diff to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffRequest {
-    Worktree { path: String },
-    Commit { sha: String, path: String },
+    Worktree {
+        path: String,
+    },
+    Commit {
+        sha: String,
+        path: String,
+    },
+    /// One file from the branch's diff against its base.
+    Branch {
+        name: String,
+        path: String,
+    },
 }
 
 /// Unified diff text, or a placeholder kind. Rows are built in the window store.
@@ -640,6 +650,17 @@ impl SelectionSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Anchor {
     Lane(String),
+    Commit { sha: String, below: bool },
+}
+
+/// Where a dragged branch lands.
+///
+/// `Reference { below: false }` stacks the branch above that branch.
+/// `Reference { below: true }` places it under an empty branch.
+/// `Commit { below: true }` on the branch's oldest commit places it under that branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchAnchor {
+    Reference { name: String, below: bool },
     Commit { sha: String, below: bool },
 }
 
@@ -1040,6 +1061,14 @@ pub trait Backend: Settings + Send + Sync {
         let _ = (id, sha);
         Err(BridgeError::not_ready("This backend does not read commits"))
     }
+    /// Every file the branch changes, compared with its base. Same read as
+    /// GitButler's "All changes" on a selected branch.
+    fn branch_files(&self, id: &str, name: &str) -> Result<Vec<CommitFile>> {
+        let _ = (id, name);
+        Err(BridgeError::not_ready(
+            "This backend does not read branch changes",
+        ))
+    }
     fn file_diff(&self, id: &str, request: DiffRequest) -> Result<TextDiff> {
         let _ = (id, request);
         Err(BridgeError::not_ready("This backend does not read diffs"))
@@ -1140,6 +1169,13 @@ pub trait Backend: Settings + Send + Sync {
     fn move_commit(&self, id: &str, shas: &[String], anchor: &Anchor) -> Result<CommitResult> {
         let _ = (id, shas, anchor);
         Err(BridgeError::not_ready("This backend does not move commits"))
+    }
+
+    fn move_branch(&self, id: &str, name: &str, anchor: &BranchAnchor) -> Result<CommitResult> {
+        let _ = (id, name, anchor);
+        Err(BridgeError::not_ready(
+            "This backend does not move branches",
+        ))
     }
 
     fn insert_blank(&self, id: &str, anchor: &Anchor) -> Result<CommitResult> {

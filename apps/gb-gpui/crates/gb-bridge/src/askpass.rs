@@ -8,11 +8,18 @@
 //!
 //! Fetch and push against a local file remote do not ask for a password. When
 //! the broker is initialized, GitButler still stats an askpass helper before
-//! running git. Tests install a stub that exits without speaking the helper
-//! protocol. A shell script cannot complete that protocol, so the round trip
-//! is driven by `AskpassBroker::submit_prompt` directly.
+//! running git. Production uses `gitbutler-git-askpass` beside this executable
+//! (built from `askpass/main.rs`). That helper speaks GitButler's socket
+//! protocol, so a real password reaches the dialog in this window. If the
+//! sibling file is missing, the embedded helper is written to the cache and
+//! `GITBUTLER_ASKPASS_BIN` points at it.
+//!
+//! Tests that only need the stat install a stub that exits without speaking
+//! the protocol. A shell script cannot complete that protocol, so those tests
+//! drive the round trip with `AskpassBroker::submit_prompt` directly.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -20,6 +27,9 @@ use std::time::Duration;
 use crate::{AskpassKind, AskpassRequest, Backend, BridgeError, Result, Secret};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `gitbutler-git-askpass` binary produced by `build.rs`.
+const HELPER_BYTES: &[u8] = include_bytes!(env!("GB_ASKPASS_HELPER"));
 
 pub(crate) type PromptListener = Arc<dyn Fn(AskpassRequest) + Send + Sync>;
 
@@ -105,6 +115,7 @@ impl FakeAskpass {
 }
 
 pub(crate) fn install() -> Result<()> {
+    install_helper()?;
     if STATE.get().is_none() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .thread_name("gb-askpass")
@@ -157,11 +168,145 @@ pub(crate) fn install_fetch_stub() -> Result<()> {
         })?;
     }
     if std::env::var_os("GITBUTLER_ASKPASS_BIN").is_none() {
-        unsafe {
-            std::env::set_var("GITBUTLER_ASKPASS_BIN", &path);
-        }
+        set_askpass_bin(&path);
     }
     Ok(())
+}
+
+/// Make a real helper visible to `gitbutler-git` before the first fetch.
+///
+/// An override that already names a file is left alone, so the test stub stays
+/// in place. Otherwise GitButler looks beside this executable. The cache copy
+/// is only for a launch that has no sibling, and the variable is set before
+/// the UI runtime starts.
+fn install_helper() -> Result<()> {
+    if let Some(path) = std::env::var_os("GITBUTLER_ASKPASS_BIN")
+        && Path::new(&path).is_file()
+    {
+        return Ok(());
+    }
+    if sibling_helper().is_some() {
+        return Ok(());
+    }
+    let path = write_cached_helper()?;
+    set_askpass_bin(&path);
+    Ok(())
+}
+
+fn sibling_helper() -> Option<PathBuf> {
+    let mut current = std::env::current_exe().ok()?;
+    #[cfg(unix)]
+    {
+        current = current.canonicalize().unwrap_or(current);
+    }
+    // Match `gitbutler-git`: a test binary lives in `deps/`, and the helper
+    // is looked up beside that directory.
+    if current.iter().nth_back(1) == Some(std::ffi::OsStr::new("deps")) {
+        current = current.parent()?.to_path_buf();
+    }
+    let path = current
+        .with_file_name("gitbutler-git-askpass")
+        .with_extension(std::env::consts::EXE_EXTENSION);
+    executable(&path).then_some(path)
+}
+
+fn write_cached_helper() -> Result<PathBuf> {
+    let path = cache_helper_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            BridgeError::internal(format!("Could not create the askpass directory: {error}"))
+        })?;
+        restrict_directory(parent)?;
+    }
+    if std::fs::read(&path).ok().as_deref() != Some(HELPER_BYTES) {
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, HELPER_BYTES).map_err(|error| {
+            BridgeError::internal(format!("Could not write the askpass helper: {error}"))
+        })?;
+        mark_executable(&temporary)?;
+        std::fs::rename(&temporary, &path).map_err(|error| {
+            BridgeError::internal(format!("Could not install the askpass helper: {error}"))
+        })?;
+    }
+    mark_executable(&path)?;
+    Ok(path)
+}
+
+fn cache_helper_path() -> PathBuf {
+    let root = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Caches"))
+            .unwrap_or_else(std::env::temp_dir)
+    } else if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
+        PathBuf::from(cache)
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache")
+    } else {
+        std::env::temp_dir()
+    };
+    root.join("gb-gpui").join(format!(
+        "gitbutler-git-askpass{}",
+        std::env::consts::EXE_SUFFIX
+    ))
+}
+
+fn executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn mark_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(
+            |error| {
+                BridgeError::internal(format!(
+                    "Could not mark the askpass helper executable: {error}"
+                ))
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn restrict_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                BridgeError::internal(format!("Could not protect the askpass directory: {error}"))
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn set_askpass_bin(path: &Path) {
+    // Safety: `std::env::set_var` is unsafe because it races with `getenv`.
+    // This runs from `main` before GPUI or the bridge runtime starts threads.
+    // Git reads the variable in a child process.
+    unsafe {
+        std::env::set_var("GITBUTLER_ASKPASS_BIN", path);
+    }
 }
 
 pub(crate) fn set_timeout(timeout: Duration) {
@@ -305,8 +450,94 @@ pub(crate) fn classify(prompt: &str) -> AskpassKind {
 
 #[cfg(test)]
 mod tests {
-    use super::classify;
+    use super::{HELPER_BYTES, classify};
     use crate::{AskpassKind, Secret};
+
+    #[cfg(unix)]
+    #[test]
+    fn askpass_helper_speaks_the_socket_protocol() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("gitbutler-git-askpass");
+        std::fs::write(&bin, HELPER_BYTES).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let missing = Command::new(&bin).output().unwrap();
+        assert!(
+            !missing.status.success(),
+            "a direct launch must fail before it speaks"
+        );
+
+        let sock = dir.path().join("sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut child = Command::new(&bin)
+            .arg("Password for 'https://example.test': ")
+            .env("GITBUTLER_ASKPASS_PIPE", &sock)
+            .env("GITBUTLER_ASKPASS_SECRET", "s3cret-token")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let started = Instant::now();
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(5) {
+                        let _ = child.kill();
+                        let output = child.wait_with_output().unwrap();
+                        panic!(
+                            "helper did not connect: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut secret = String::new();
+        reader.read_line(&mut secret).unwrap();
+        assert_eq!(secret.trim_end_matches(['\r', '\n']), "s3cret-token");
+        let mut prompt = String::new();
+        reader.read_line(&mut prompt).unwrap();
+        assert_eq!(
+            prompt.trim_end_matches(['\r', '\n']),
+            "Password for 'https://example.test': "
+        );
+        writeln!(stream, "hunter2").unwrap();
+
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break status,
+                None if started.elapsed() > Duration::from_secs(5) => {
+                    let _ = child.kill();
+                    panic!("helper hung after the reply");
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            status.success(),
+            "stderr {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"hunter2\n");
+    }
 
     #[test]
     fn secret_debug_redacts_and_kinds_follow_the_prompt() {

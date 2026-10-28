@@ -306,6 +306,37 @@ pub(crate) fn uncommit_changes(
     Ok(commit_result(id, outcome.workspace, None, Vec::new()))
 }
 
+pub(crate) fn move_branch(
+    source: VersionSource,
+    id: &str,
+    hub: &Hub,
+    name: &str,
+    anchor: &crate::BranchAnchor,
+) -> Result<CommitResult> {
+    // This GitButler build stacks the subject on top of a branch. A drop below
+    // another branch is planned as a stack onto the branch under it.
+    let crate::BranchAnchor::Reference {
+        name: onto,
+        below: false,
+    } = anchor
+    else {
+        return Err(BridgeError::not_ready(
+            "Stack this branch on top of another branch.",
+        ));
+    };
+    let subject = local_ref(name)?;
+    let onto = local_ref(onto)?;
+    let mut gate = WriteGate::open(source, id, hub)?;
+    let moved = but_api::branch::move_branch(
+        &mut gate.ctx,
+        subject.as_ref(),
+        onto.as_ref(),
+        but_core::DryRun::No,
+    )
+    .map_err(|error| api_error("move this branch", error))?;
+    Ok(commit_result(id, moved.workspace, None, Vec::new()))
+}
+
 pub(crate) fn move_commit(
     source: VersionSource,
     id: &str,

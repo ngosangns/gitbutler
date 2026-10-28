@@ -11,15 +11,15 @@ use crate::messages::{FakeMessageGenerator, MessageGenerator, SuggestedMessage};
 use crate::settings::{GlobalPatch, GlobalSettings, ProjectSettings, Settings, SigningReport};
 use crate::{
     Anchor, ApplyResult, AskpassKind, AskpassRequest, AskpassWatch, AssignedHunk, Backend,
-    BaseBranchData, BranchDetails, BranchPlace, BranchRow, BranchSummary, BridgeError, BridgeEvent,
-    CommitDetails, CommitFile, CommitResult, CommitSummary, Compat, ConflictChoice,
-    ConflictedCommit, DiffRequest, DiscardResult, EDIT_MODE_MESSAGE, EditStatus, Environment,
-    FakeWatch, FetchReport, FetchStatus, FileChange, FileChoice, FileStatus, ForcePush, HookReport,
-    HookStatus, HunkRef, IntegratePreview, IntegrateReport, IntegrateResolution, LaneCreated,
-    LaneResolution, PINNED_VERSION, ProjectList, ProjectSummary, PushReport, PushedBranch,
-    RemoteBranch, ResolveReport, Result, SelectionSpec, SnapshotChange, SnapshotInfo, StackSummary,
-    TextDiff, UndoResult, UpstreamCommit, UpstreamStrategy, WatchHandle, WorkspaceSummary,
-    WorktreeView,
+    BaseBranchData, BranchAnchor, BranchDetails, BranchPlace, BranchRow, BranchSummary,
+    BridgeError, BridgeEvent, CommitDetails, CommitFile, CommitResult, CommitSummary, Compat,
+    ConflictChoice, ConflictedCommit, DiffRequest, DiscardResult, EDIT_MODE_MESSAGE, EditStatus,
+    Environment, FakeWatch, FetchReport, FetchStatus, FileChange, FileChoice, FileStatus,
+    ForcePush, HookReport, HookStatus, HunkRef, IntegratePreview, IntegrateReport,
+    IntegrateResolution, LaneCreated, LaneResolution, PINNED_VERSION, ProjectList, ProjectSummary,
+    PushReport, PushedBranch, RemoteBranch, ResolveReport, Result, SelectionSpec, SnapshotChange,
+    SnapshotInfo, StackSummary, TextDiff, UndoResult, UpstreamCommit, UpstreamStrategy,
+    WatchHandle, WorkspaceSummary, WorktreeView,
 };
 
 #[derive(Clone)]
@@ -1271,6 +1271,73 @@ fn uncommit_changes_in(
     Ok(commit_result(state, id, Some(new_sha)))
 }
 
+fn find_branch(workspace: &WorkspaceSummary, name: &str) -> Result<(usize, usize)> {
+    for (stack_index, stack) in workspace.stacks.iter().enumerate() {
+        if let Some(branch_index) = stack.branches.iter().position(|branch| branch.name == name) {
+            return Ok((stack_index, branch_index));
+        }
+    }
+    Err(BridgeError::not_found(format!("No lane named {name}")))
+}
+
+fn move_branch_in(
+    state: &mut FakeState,
+    id: &str,
+    name: &str,
+    anchor: &BranchAnchor,
+) -> Result<CommitResult> {
+    if name.trim().is_empty() {
+        return Err(BridgeError::not_ready("Choose a branch to move."));
+    }
+    ensure_project(state, id)?;
+    refuse_edit(state, id)?;
+    {
+        let workspace = state.workspaces.get(id).expect("checked");
+        find_branch(workspace, name)?;
+        match anchor {
+            BranchAnchor::Reference { name: target, .. } => {
+                if target == name {
+                    return Err(BridgeError::not_ready(
+                        "A branch cannot be dropped on itself.",
+                    ));
+                }
+                find_branch(workspace, target)?;
+            }
+            BranchAnchor::Commit { sha, .. } => {
+                let located = locate(workspace, sha)?;
+                if located.lane == name {
+                    return Err(BridgeError::not_ready(
+                        "That commit is already on this branch.",
+                    ));
+                }
+            }
+        }
+    }
+    remember(state, id, "MoveBranch", "Moved branch");
+    let workspace = state.workspaces.get_mut(id).expect("checked");
+    let (stack_index, branch_index) = find_branch(workspace, name)?;
+    let moving = workspace.stacks[stack_index].branches.remove(branch_index);
+    if workspace.stacks[stack_index].branches.is_empty() {
+        workspace.stacks.remove(stack_index);
+    }
+    let (target_stack, insert_at) = match anchor {
+        BranchAnchor::Reference { name, below } => {
+            let (stack, index) = find_branch(workspace, name)?;
+            (stack, if *below { index + 1 } else { index })
+        }
+        BranchAnchor::Commit { sha, below } => {
+            let located = locate(workspace, sha)?;
+            let (stack, index) = find_branch(workspace, &located.lane)?;
+            (stack, if *below { index + 1 } else { index })
+        }
+    };
+    let len = workspace.stacks[target_stack].branches.len();
+    workspace.stacks[target_stack]
+        .branches
+        .insert(insert_at.min(len), moving);
+    Ok(commit_result(state, id, None))
+}
+
 fn move_commit_in(
     state: &mut FakeState,
     id: &str,
@@ -2221,6 +2288,54 @@ fn hunk(header: &str, lane: Option<&str>) -> AssignedHunk {
     }
 }
 
+/// Union of the branch's commits. The tip is last, so its status wins when
+/// the same path shows up in more than one commit. The preview has no tree
+/// diff; the live backend uses `branch_diff` instead.
+fn files_on_branch(state: &FakeState, id: &str, name: &str) -> Result<Vec<CommitFile>> {
+    let workspace = state
+        .workspaces
+        .get(id)
+        .ok_or_else(|| BridgeError::not_found(format!("No project with id {id}")))?;
+    let branch = workspace
+        .stacks
+        .iter()
+        .flat_map(|stack| &stack.branches)
+        .find(|branch| branch.name == name)
+        .ok_or_else(|| BridgeError::not_found(format!("No branch {name}")))?;
+    let mut files: Vec<CommitFile> = Vec::new();
+    for summary in branch.commits.iter().rev() {
+        let Some(details) = state.commits.get(&summary.sha) else {
+            continue;
+        };
+        for file in &details.files {
+            if let Some(existing) = files.iter_mut().find(|item| item.path == file.path) {
+                existing.status = file.status;
+                existing.additions = existing.additions.saturating_add(file.additions);
+                existing.deletions = existing.deletions.saturating_add(file.deletions);
+            } else {
+                files.push(file.clone());
+            }
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn canned_file_diff(path: String) -> Result<TextDiff> {
+    if path.ends_with(".bin") {
+        return Ok(TextDiff {
+            path,
+            patch: String::new(),
+            binary: true,
+            too_large: false,
+        });
+    }
+    Ok(text_diff(
+        &path,
+        format!("@@ -1,1 +1,2 @@\n context\n+change in {path}\n"),
+    ))
+}
+
 fn text_diff(path: &str, patch: String) -> TextDiff {
     TextDiff {
         path: path.to_string(),
@@ -2577,6 +2692,15 @@ impl Backend for FakeBackend {
             .ok_or_else(|| BridgeError::not_found(format!("No commit {sha}")))
     }
 
+    fn branch_files(&self, id: &str, name: &str) -> Result<Vec<CommitFile>> {
+        self.gate("branch_files")?;
+        let state = self.locked();
+        if state.env.compat != Compat::Match {
+            return Err(crate::compat_error(&state.env));
+        }
+        files_on_branch(&state, id, name)
+    }
+
     fn file_diff(&self, id: &str, request: DiffRequest) -> Result<TextDiff> {
         self.gate("file_diff")?;
         let state = self.locked();
@@ -2602,18 +2726,16 @@ impl Backend for FakeBackend {
                         "{path} is not part of commit {sha}"
                     )));
                 }
-                if path.ends_with(".bin") {
-                    return Ok(TextDiff {
-                        path,
-                        patch: String::new(),
-                        binary: true,
-                        too_large: false,
-                    });
+                canned_file_diff(path)
+            }
+            DiffRequest::Branch { name, path } => {
+                let files = files_on_branch(&state, id, &name)?;
+                if !files.iter().any(|file| file.path == path) {
+                    return Err(BridgeError::not_found(format!(
+                        "{path} is not part of branch {name}"
+                    )));
                 }
-                Ok(text_diff(
-                    &path,
-                    format!("@@ -1,1 +1,2 @@\n context\n+change in {path}\n"),
-                ))
+                canned_file_diff(path)
             }
         }
     }
@@ -2788,6 +2910,13 @@ impl Backend for FakeBackend {
     fn move_commit(&self, id: &str, shas: &[String], anchor: &Anchor) -> Result<CommitResult> {
         self.gate("move_commit")?;
         let result = move_commit_in(&mut self.locked(), id, shas, anchor)?;
+        self.publish(id);
+        Ok(result)
+    }
+
+    fn move_branch(&self, id: &str, name: &str, anchor: &BranchAnchor) -> Result<CommitResult> {
+        self.gate("move_branch")?;
+        let result = move_branch_in(&mut self.locked(), id, name, anchor)?;
         self.publish(id);
         Ok(result)
     }

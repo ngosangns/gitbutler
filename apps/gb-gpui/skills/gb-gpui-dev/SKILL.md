@@ -35,6 +35,8 @@ If `gb-gpui.sock` answers `ping`, it belongs to another process. Do not delete i
 | Fake | `GB_GPUI_FAKE=1` | Memory only. Demo project, canned reviews, in-memory settings. |
 | Live | no `GB_GPUI_FAKE` | The app data directory selected by `CHANNEL` and `E2E_TEST_APP_DATA_DIR`. |
 
+`task dev:install` builds with `CHANNEL=release` and reopens `~/Applications/gb-gpui Dev.app` without `GB_GPUI_FAKE`, so that window uses the same project list as GitButler.app. A Dev.app still running on canned data is quit and reopened the same way. Screenshots and tests stay on `GB_GPUI_FAKE=1`.
+
 `require_preview` refuses a write command unless the process was started with `GB_GPUI_FAKE`. Those commands return `This command writes changes and only runs in the preview.`
 
 Release packaging (`apps/gb-gpui/scripts/package-app.sh`) builds without the `devtools` feature. That `.app` has no socket. A screenshot build is a separate `.app` with `--features devtools` and bundle id `com.ngosangns.gb-gpui.dev`.
@@ -151,5 +153,5 @@ The picture is the offscreen PNG. It does not include other windows. Quit the de
 
 - Bundle id `com.ngosangns.gb-gpui`, name `gb-gpui`, version `0.22.3`.
 - Release build without `devtools`. `--debug` uses the debug profile, still without `devtools`. `--check` verifies `Info.plist`, the executable bit, `AppIcon.icns`, `ASKPASS.txt`, and the absence of `ns-dev-`, `NS_DEVTOOLS`, and `devtools: cannot listen`.
-- The bridge does not ship an askpass binary. `Resources/ASKPASS.txt` says the runtime stub is `$TMPDIR/gb-bridge-askpass-stub` and that `GITBUTLER_ASKPASS_BIN` is set only when it was unset.
+- The bundle ships `Contents/MacOS/gitbutler-git-askpass` beside `gb-gpui`. Git runs it when a fetch or push asks for a password, and the app shows the dialog. `Resources/ASKPASS.txt` names that helper. `GITBUTLER_ASKPASS_BIN` overrides it when the variable already points at a file.
 - The script does not install, launch, or sign.

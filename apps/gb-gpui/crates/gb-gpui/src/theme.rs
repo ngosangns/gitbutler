@@ -1,7 +1,8 @@
 // Hallmark v2.0.0 · GitButler · theme: GitButler brand, mint #A9F0EC on tinted near-black read from the installed icon · shape: app screen · scope: app · redesign: full · nav: 44px header with page tabs · footer: 24px status bar · signature: the mint lane rail that carries each branch band · mono: material (git ledger)
 // Hallmark · pre-emit critique: P5 H4 E5 S4 R5 V4 · weakest: V, a native GPUI window cannot run the CSS render tier; swept the workspace, diff, composer, branches, history, settings, keyboard and menus at 1440x900 over the dev socket and walked the judged gates by hand · signature: the lane rail also holds the selected lane, so state and identity share one 2px mark
 // Hallmark · waive 64: every label is mono, because the material is a git ledger and a diff; the chrome follows suit so one family carries the window
-// Hallmark · answered F4: one filled primary action per view (Commit in the composer); fetch, undo, settings and refresh are ghost icon buttons
+// Hallmark · answered F4: one filled primary per view. Commit in the composer. Restore to here on History. Fetch, undo, settings and refresh stay ghost icons
+// Hallmark · history screen: ledger beside the selected snapshot's files · signature: that file list, Restore on the snapshot · dropped the visible line "Escape returns to the workspace" · 69, it restated the History tab; #history-hint keeps the sentence in its tooltip
 
 //! The GitButler window palette. ns-ui has no GitButler tint, so the window
 //! builds its own `ns_ui::Theme` and points Ely's widgets at it at startup.
